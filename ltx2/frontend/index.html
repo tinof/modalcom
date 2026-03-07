@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>{{ model_name }}</title>
+  <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: system-ui, sans-serif; background: #0a0a0a; color: #e5e5e5; min-height: 100vh; display: flex; justify-content: center; padding: 2rem; }
+    .container { max-width: 640px; width: 100%; }
+    h1 { font-size: 1.5rem; margin-bottom: 1.5rem; color: #fff; }
+    label { display: block; font-size: 0.875rem; color: #a3a3a3; margin-bottom: 0.25rem; }
+    input, textarea { width: 100%; padding: 0.5rem 0.75rem; background: #171717; border: 1px solid #262626; border-radius: 0.5rem; color: #e5e5e5; font-size: 0.875rem; margin-bottom: 1rem; }
+    textarea { resize: vertical; min-height: 4rem; }
+    input[type="file"] { padding: 0.375rem; }
+    button { background: #2563eb; color: #fff; border: none; padding: 0.625rem 1.5rem; border-radius: 0.5rem; font-size: 0.875rem; cursor: pointer; width: 100%; }
+    button:hover { background: #1d4ed8; }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    .status { margin-top: 1rem; font-size: 0.875rem; color: #a3a3a3; }
+    video { width: 100%; border-radius: 0.5rem; margin-top: 1rem; }
+    .error { color: #ef4444; }
+    .fields { display: grid; grid-template-columns: 1fr 1fr; gap: 0 1rem; }
+  </style>
+</head>
+<body>
+  <div class="container" x-data="app()">
+    <h1>{{ model_name }}</h1>
+
+    <label for="image">Image</label>
+    <input type="file" id="image" accept="image/*" @change="imageFile = $event.target.files[0]" />
+
+    <label for="prompt">Prompt</label>
+    <textarea id="prompt" x-model="prompt" placeholder="Describe the video...">{{ default_prompt }}</textarea>
+
+    <div class="fields">
+      <div>
+        <label for="frames">Frames (default: 121)</label>
+        <input id="frames" type="number" x-model.number="numFrames" placeholder="121" />
+      </div>
+      <div>
+        <label for="steps">Steps (default: 15)</label>
+        <input id="steps" type="number" x-model.number="numSteps" placeholder="15" />
+      </div>
+      <div>
+        <label for="cfg">CFG Scale (default: 3.0)</label>
+        <input id="cfg" type="number" step="0.1" x-model.number="cfgScale" placeholder="3.0" />
+      </div>
+      <div>
+        <label for="seed">Seed (optional)</label>
+        <input id="seed" type="number" x-model.number="seed" placeholder="Random" />
+      </div>
+    </div>
+
+    <button @click="generate()" :disabled="loading || !imageFile">
+      <span x-show="!loading">Generate Video</span>
+      <span x-show="loading">Generating...</span>
+    </button>
+
+    <div class="status" x-show="statusMsg" x-text="statusMsg" :class="{ error: isError }"></div>
+
+    <video x-show="videoUrl" :src="videoUrl" controls autoplay loop></video>
+  </div>
+
+  <script>
+    function app() {
+      return {
+        prompt: "{{ default_prompt }}",
+        imageFile: null,
+        numFrames: null,
+        numSteps: null,
+        cfgScale: null,
+        seed: null,
+        loading: false,
+        statusMsg: "",
+        isError: false,
+        videoUrl: null,
+
+        async generate() {
+          this.loading = true;
+          this.statusMsg = "Uploading and generating video... this may take a few minutes.";
+          this.isError = false;
+          this.videoUrl = null;
+
+          const form = new FormData();
+          const imageBytes = new Uint8Array(await this.imageFile.arrayBuffer());
+          form.append("image_bytes", new Blob([imageBytes]), this.imageFile.name);
+          form.append("prompt", this.prompt);
+          if (this.numFrames) form.append("num_frames", this.numFrames);
+          if (this.numSteps) form.append("num_inference_steps", this.numSteps);
+          if (this.cfgScale) form.append("cfg_scale", this.cfgScale);
+          if (this.seed) form.append("seed", this.seed);
+
+          try {
+            const res = await fetch("{{ inference_url }}", { method: "POST", body: form });
+            if (!res.ok) throw new Error(`Server error: ${res.status}`);
+            const blob = await res.blob();
+            this.videoUrl = URL.createObjectURL(blob);
+            this.statusMsg = "Done!";
+          } catch (e) {
+            this.isError = true;
+            this.statusMsg = `Error: ${e.message}`;
+          } finally {
+            this.loading = false;
+          }
+        },
+      };
+    }
+  </script>
+</body>
+</html>
