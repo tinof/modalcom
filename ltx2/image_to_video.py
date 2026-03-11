@@ -40,12 +40,12 @@ image = (
     .apt_install("python3-opencv", "ffmpeg", "git")
     .run_commands(
         "pip install 'transformers==4.57.3' 'torch==2.7.1'",
+        "pip install uv-build",  # build backend required by ltx packages
         "pip install --no-deps 'ltx-core @ git+https://github.com/Lightricks/LTX-2.git#subdirectory=packages/ltx-core'",
         "pip install --no-deps 'ltx-pipelines @ git+https://github.com/Lightricks/LTX-2.git#subdirectory=packages/ltx-pipelines'",
-        "pip install torchaudio einops accelerate scipy av",
+        "pip install torchaudio==2.7.1 torchvision==0.22.1 einops accelerate scipy av",
     )
     .uv_pip_install(
-        "torchvision",
         "huggingface-hub[hf_xet]",
         "fastapi[standard]==0.115.8",
         "imageio==2.37.0",
@@ -63,6 +63,7 @@ image = (
 # - **Distilled LoRA**: parameter-efficient adaptation with per-stage strengths
 
 MODEL_REPO = "Lightricks/LTX-2.3"
+GEMMA_REPO = "google/gemma-3-12b-it-qat-q4_0-unquantized"
 CHECKPOINT_FILE = "ltx-2.3-22b-dev.safetensors"
 DISTILLED_LORA_FILE = "ltx-2.3-22b-distilled-lora-384.safetensors"
 SPATIAL_UPSAMPLER_FILE = "ltx-2.3-spatial-upscaler-x2-1.0.safetensors"
@@ -115,8 +116,65 @@ with image.imports():
     from ltx_core.components.guiders import MultiModalGuiderParams
     from ltx_core.loader import LTXV_LORA_COMFY_RENAMING_MAP, LoraPathStrengthAndSDOps
     from ltx_pipelines.ti2vid_two_stages_hq import TI2VidTwoStagesHQPipeline
+    from ltx_pipelines.utils.args import ImageConditioningInput
 
 MINUTES = 60
+
+
+@app.function(
+    image=image,
+    secrets=[modal.Secret.from_name("huggingface")],
+    timeout=2 * MINUTES,
+)
+def preflight_check():
+    """Verify HF token exists and has download access to the gated Gemma model."""
+    import os
+
+    from huggingface_hub import HfApi, hf_hub_download
+
+    hf_token = (
+        os.environ.get("HF_TOKEN")
+        or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+        or os.environ.get("HUGGINGFACE_TOKEN")
+    )
+
+    if not hf_token:
+        raise RuntimeError(
+            "\n\nNo HuggingFace token found in Modal secret 'huggingface'.\n"
+            "Create one with:\n"
+            "  modal secret create huggingface HF_TOKEN=hf_your_token_here\n"
+        )
+
+    # Test metadata access first
+    try:
+        HfApi().model_info(GEMMA_REPO, token=hf_token)
+    except Exception as e:
+        raise RuntimeError(
+            f"\n\nHuggingFace token does not have access to {GEMMA_REPO}.\n"
+            f"Fix:\n"
+            f"  1. Accept the model terms at: https://huggingface.co/{GEMMA_REPO}\n"
+            f"  2. Ensure the token belongs to the same HF account.\n"
+            f"  3. Update the Modal secret if needed:\n"
+            f"       modal secret create huggingface HF_TOKEN=hf_your_token_here --force\n"
+            f"Original error: {e}\n"
+        ) from e
+
+    # Test actual file download access — fine-grained tokens can pass model_info
+    # but fail snapshot_download with 401 if they lack file-download scope.
+    # config.json is tiny and always present in any HF repo.
+    try:
+        hf_hub_download(GEMMA_REPO, filename="config.json", token=hf_token)
+    except Exception as e:
+        raise RuntimeError(
+            f"\n\nHuggingFace token can read metadata for {GEMMA_REPO} but cannot download files.\n"
+            f"This usually means you are using a fine-grained token without file-download scope.\n"
+            f"Fix: create a classic 'Read' token at https://huggingface.co/settings/tokens\n"
+            f"Then update the Modal secret:\n"
+            f"  modal secret create huggingface HF_TOKEN=hf_your_classic_token --force\n"
+            f"Original error: {e}\n"
+        ) from e
+
+    print(f"Preflight OK: token has metadata and download access to {GEMMA_REPO}")
 
 
 @app.cls(
@@ -125,15 +183,23 @@ MINUTES = 60
     timeout=10 * MINUTES,
     scaledown_window=10 * MINUTES,
     volumes={MODEL_PATH: model_volume, OUTPUT_PATH: output_volume},
+    secrets=[modal.Secret.from_name("huggingface")],
 )
 class Inference:
     @modal.enter()
     def load_pipeline(self):
+        import os
+
         from huggingface_hub import snapshot_download
 
         model_dir = f"{MODEL_PATH}/ltx2.3"
+        hf_token = (
+            os.environ.get("HF_TOKEN")
+            or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+            or os.environ.get("HUGGINGFACE_TOKEN")
+        )
 
-        # Download only the files we need (the full repo is large)
+        # Download LTX-2.3 model weights
         snapshot_download(
             MODEL_REPO,
             local_dir=model_dir,
@@ -141,10 +207,14 @@ class Inference:
                 CHECKPOINT_FILE,
                 DISTILLED_LORA_FILE,
                 SPATIAL_UPSAMPLER_FILE,
-                "text_encoder/*",
-                "tokenizer/*",
             ],
+            token=hf_token,
         )
+
+        # Download Gemma 3 text encoder into HF cache (HF_HUB_CACHE=/models).
+        # Using cache mode (no local_dir) avoids a fine-grained token scope issue
+        # that causes 401 errors when using local_dir with gated repos.
+        gemma_dir = snapshot_download(GEMMA_REPO, token=hf_token)
         model_volume.commit()
 
         checkpoint_path = f"{model_dir}/{CHECKPOINT_FILE}"
@@ -165,7 +235,7 @@ class Inference:
             distilled_lora_strength_stage_1=0.25,
             distilled_lora_strength_stage_2=0.5,
             spatial_upsampler_path=upsampler_path,
-            gemma_root=model_dir,
+            gemma_root=gemma_dir,
             loras=(),
         )
 
@@ -180,7 +250,7 @@ class Inference:
         seed: Optional[int] = None,
     ) -> str:
         width = 960
-        height = 544
+        height = 576  # must be divisible by 64 for two-stage HQ pipeline
         num_frames = num_frames or 121  # ~5 seconds at 24fps
         num_inference_steps = num_inference_steps or 15
         cfg_scale = cfg_scale or 3.0
@@ -233,7 +303,7 @@ class Inference:
             num_inference_steps=num_inference_steps,
             video_guider_params=video_guider_params,
             audio_guider_params=audio_guider_params,
-            images=[(image_path, 0, 1.0)],
+            images=[ImageConditioningInput(path=image_path, frame_idx=0, strength=1.0)],
         )
 
         # Collect all frames and export to MP4
@@ -306,6 +376,10 @@ def entrypoint(
 
     print(f"🎥 Generating a video from the image at {image_path}")
     print(f"🎥 using the prompt {prompt}")
+
+    print("Running preflight checks...")
+    preflight_check.remote()
+    print("Preflight passed.")
 
     if image_path.startswith(("http://", "https://")):
         image_bytes = urllib.request.urlopen(image_path).read()

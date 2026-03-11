@@ -43,10 +43,10 @@ FP8 checkpoints cause tensor size mismatch when fusing the distilled LoRA. Alway
 
 - Uses `TI2VidTwoStagesHQPipeline` from `ltx_pipelines.ti2vid_two_stages_hq` (NOT HuggingFace diffusers)
 - HQ pipeline: Res2s second-order sampler (not Euler), per-stage LoRA strengths (0.25/0.5)
-- Two-stage: low-res generation (960×544) + 2x spatial upsampling → full HD (1920×1088)
+- Two-stage: low-res generation (960×576) + 2x spatial upsampling → full HD (1920×1152)
 - Returns `(Iterator[torch.Tensor], Audio)` — video frames + audio
 - Frames are `(T, H, W, C)` uint8 tensors — no permutation needed for imageio
-- Image input format: file path tuples `(path, frame_idx, strength)`
+- Image input format: `ImageConditioningInput(path, frame_idx, strength)` NamedTuple from `ltx_pipelines.utils.args`
 - Default: 15 steps, 24fps, 121 frames (~5s), cfg_scale=3.0, no STG
 
 ## Modal Resources

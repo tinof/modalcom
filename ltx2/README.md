@@ -5,8 +5,8 @@ Generate videos from images using [Lightricks LTX-2.3](https://github.com/Lightr
 ## Architecture
 
 LTX-2.3 uses a **two-stage HQ pipeline** (`TI2VidTwoStagesHQPipeline`):
-1. Low-resolution video generation (960×544) from text + image conditioning
-2. 2x spatial upsampling for full HD (1920×1088) output
+1. Low-resolution video generation (960×576) from text + image conditioning
+2. 2x spatial upsampling for full HD (1920×1152) output
 
 The HQ pipeline uses a second-order **Res2s sampler** (instead of Euler) for significantly improved quality, and applies per-stage distilled LoRA strengths for optimal results.
 
@@ -29,16 +29,30 @@ Source: [Lightricks/LTX-2.3 on HuggingFace](https://huggingface.co/Lightricks/LT
 | Model size | 19B parameters | 22B parameters |
 | Pipeline | `TI2VidTwoStagesPipeline` | `TI2VidTwoStagesHQPipeline` |
 | Sampler | Euler | Res2s (second-order) |
-| Resolution | 768×512 | 1920×1088 (full HD) |
+| Resolution | 768×512 | 1920×1152 (full HD) |
 | Default steps | 40 | 15 |
 | Default fps | 25 | 24 |
 | LoRA strength | Single (0.8) | Per-stage (0.25 / 0.5) |
 | STG guidance | stg_scale=1.0, stg_blocks=[29] | Not needed (Res2s handles coherence) |
+| Image input | plain tuple `(path, idx, strength)` | `ImageConditioningInput` NamedTuple |
 
 ## Prerequisites
 
 - Python 3.12
 - Modal account and CLI: `pip install modal && modal setup`
+
+### HuggingFace Access (required — do this first)
+
+The text encoder is the gated model `google/gemma-3-12b-it-qat-q4_0-unquantized`. Before running:
+
+1. **Accept the Gemma terms** at `https://huggingface.co/google/gemma-3-12b-it-qat-q4_0-unquantized` — click "Agree and access repository" while logged in.
+2. **Create a Modal secret** with your HuggingFace token:
+   ```bash
+   modal secret create huggingface HF_TOKEN=hf_your_token_here
+   ```
+   Your token must belong to the same HF account that accepted the Gemma terms.
+
+Without this, the run will fail with `GatedRepoError: 401 Client Error`.
 
 ## Usage
 
@@ -76,7 +90,7 @@ curl -X POST "https://<your-url>/inference-web" \
   -F "image_bytes=@photo.png" \
   -F "prompt=A bird takes flight from a rooftop" \
   -F "num_frames=121" \
-  -F "seed=42"
+  -F "seed=42" \
   --output video.mp4
 ```
 
@@ -115,6 +129,8 @@ The `MultiModalGuiderParams` control video generation quality:
 
 - **First cold start** downloads ~40GB of model weights to the volume. Subsequent starts use the cached weights.
 - **torch.inference_mode workaround**: The spatial upsampler and VAE decoder use `conv3d` under `@torch.inference_mode()` decorators, which causes `RuntimeError: Inference tensors cannot be saved for backward`. We patch `torch.inference_mode = torch.no_grad` before importing `ltx_pipelines` to avoid this.
+- **`ImageConditioningInput` required**: The `images` parameter of the HQ pipeline expects `ImageConditioningInput` NamedTuples (from `ltx_pipelines.utils.args`), not plain tuples. The pipeline internally accesses `.path`, `.frame_idx`, `.strength`, and `.crf` attributes.
+- **Resolution must be divisible by 64**: The pipeline asserts both width and height are multiples of 64. Default low-res stage uses 960×576 (both divisible by 64).
 - `ltx-core` and `ltx-pipelines` are installed from git (not PyPI). Pin to a commit hash for reproducibility by changing the git URL to include `@<commit-sha>`.
 - The bf16 checkpoint is used because the FP8 variant causes tensor size mismatches during LoRA fusion with the distilled LoRA weights.
 - **H100 memory**: 22B params in bf16 ≈ 44GB VRAM + text encoder + upsampler + activations ≈ 60-70GB peak. Fits within H100's 80GB.
