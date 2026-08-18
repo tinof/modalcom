@@ -1,0 +1,13 @@
+[project]
+name = "rtx_modal_upscaler"
+description = "NVIDIA RTX media upscaler service for Modal.com using RTX Video Super Resolution."
+version = "0.2.0"
+license = "LICENSE"
+# Container runtime deps are pinned in the modal_app.py image definitions.
+dependencies = [
+  "modal>=1.5.4",
+  "requests>=2.32.0"
+]
+
+[project.urls]
+Repository = "https://github.com/tinof/modalcom"

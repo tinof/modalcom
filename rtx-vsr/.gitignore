@@ -1,0 +1,11 @@
+.DS_Store
+*.pyc
+__pycache__/
+*.so
+*.egg-info/
+dist/
+build/
+.venv/
+
+# Rendered comparison material from quality tuning (regenerable, ~1 GB).
+outputs/
