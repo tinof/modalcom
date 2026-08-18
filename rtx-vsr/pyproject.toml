@@ -6,7 +6,7 @@ license = "LICENSE"
 # Container runtime deps are pinned in the modal_app.py image definitions.
 dependencies = [
   "modal>=1.5.4",
-  "requests>=2.32.0"
+  "requests>=2.33.0"
 ]
 
 [project.urls]
