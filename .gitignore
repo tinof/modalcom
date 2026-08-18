@@ -1,0 +1,31 @@
+# Media and job data — never commit; these live in the working tree or on Modal Volumes
+sample/
+samples/
+outputs/
+inputs/
+comparisons/
+*.mkv
+*.mp4
+*.mov
+
+# Model weights and checkpoints (they belong on Modal Volumes / HuggingFace)
+*.pkl
+*.pth
+*.ckpt
+*.safetensors
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+build/
+dist/
+.ruff_cache/
+.pytest_cache/
+.mypy_cache/
+
+# Local tooling / OS
+.DS_Store
+.env
