@@ -94,7 +94,11 @@ verified by a real render.
 
 ## 11. Performance workstream (2026-08-19, not yet run on GPU)
 
-Applied in full; nothing below has executed on a GPU, since Modal credits are exhausted.
+Applied in full; nothing below has executed on a GPU. The blocker moved from exhausted
+credits to a disabled `tinof` workspace, but the effect is the same: every performance claim
+here is still an estimate. The GPU image now builds successfully with the SageAttention
+kernels included, so the next attempt starts from a warm image.
+
 Measured baseline for comparison: 0.7-0.8 fps at 1080p, inference 98% of wall clock.
 
 - [x] 11.1 Default target resolution changed to 1080p (same-resolution restore is the primary workflow; 4K remains available via `--target-height 2160`)
@@ -107,5 +111,8 @@ Measured baseline for comparison: 0.7-0.8 fps at 1080p, inference 98% of wall cl
 - [x] 11.8 Safety guards found by review: driver Volume reload, CPU pre-flight, output-file frame probe on both paths, segment ordering and encoder-agreement assertions, memory pre-check, worker retries, separate driver timeout
 - [x] 11.9 Shot boundaries clamped to the decord frame count (PySceneDetect's decoder disagrees on VFR/MKV)
 - [x] 11.10 12 unit tests for segmentation and pre-flight (20 total, CPU-only)
-- [ ] 11.11 **Run the validation ladder (~$4).** Profile, then baseline / compile / FP8 on `bench_5s.mkv`, then a 3-worker parallel smoke on the 10 s clip, then the 60 s clip end to end. See README "Validation budget"
-- [ ] 11.12 Record the measured speedup and update the cost table; the 2-3x figure is an estimate until 11.11 runs
+- [x] 11.11 SageAttention (INT8 QK / FP8 PV) behind `SPARKVSR_ATTENTION_BACKEND=sage`, kernels compiled for sm_120 into the GPU image from the pinned v2.2.0 commit. Wired by replacing `F.scaled_dot_product_attention` scoped to the transformer forward, because CogVideoX's processor bypasses diffusers' attention dispatcher entirely and `set_attention_backend` would apply cleanly while changing nothing
+- [x] 11.12 VAE slicing/tiling made a knob (`SPARKVSR_VAE_TILING`, default unchanged at on) so the throughput cost of an unmeasured memory optimisation can be A/B'd
+- [x] 11.13 5 unit tests for the attention-backend gating and the tiling knob (25 total, CPU-only), including that a masked or scaled SDPA call falls through rather than being silently quantised
+- [ ] 11.14 **Run the validation ladder (~$4-5).** Profile, then baseline / compile / VAE-tiling / SageAttention / FP8 on `bench_5s.mkv`, then a 3-worker parallel smoke on the 10 s clip, then the 60 s clip end to end. See HANDOFF.md. **Blocked: the `tinof` Modal workspace is disabled**
+- [ ] 11.15 Record the measured speedup and update the cost table; the 2-3x figure is an estimate until 11.14 runs

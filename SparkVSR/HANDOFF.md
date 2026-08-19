@@ -3,6 +3,27 @@
 Last session: 2026-08-19. Written for whoever picks this up next, assuming no memory of
 how it got here.
 
+## What changed most recently
+
+A research pass on how others speed up one-step VSR on a CogVideoX backbone produced three
+things worth acting on, all now in the code and none yet measured:
+
+- **SageAttention is in** and is the highest-expected-value knob, benchmarked upstream on
+  this project's exact backbone. See "SageAttention is now wired in" below for the two
+  non-obvious details of how it had to be integrated.
+- **VAE slicing/tiling is now a knob** rather than unconditional. FastVSR (arXiv 2509.24142,
+  also one-step VSR on CogVideoX1.5) reports that once the denoiser runs a single time, the
+  VAE codec dominates the forward — so a memory optimisation we were paying for
+  unconditionally, on a card with 70 GB of headroom at 1080p, is a prime suspect.
+- **INT8 weight-only quantisation was ruled out**, not merely skipped: the CogVideoX model
+  card states it *reduces* inference speed and exists to save VRAM. Not a lever here.
+
+Also confirmed: the step-caching family (TeaCache, PAB) is structurally inapplicable, since
+a one-step model has no timestep loop to cache across. Do not let it back onto the list.
+
+The environment section at the bottom is stale in one respect and the blocker below explains
+it: the `tinof` workspace is currently disabled.
+
 ## Where things stand
 
 The pipeline **works and is verified** end to end. Earlier sessions took it from
@@ -35,6 +56,32 @@ are under 2%. Worker rate is $0.001018/s ($3.66/hr) for GPU + 8 cores + 32 GiB.
 same resolution, no upscale. It recovers 7–9x the source's high-frequency detail
 (Laplacian variance 23 → 163–211) at ~4.6x less GPU time than upscaling to 4K. Defaults
 in `config.py` reflect this; 4K is still available via `--target-height 2160`.
+
+## Blocker: the `tinof` Modal workspace is disabled
+
+As of 2026-08-19 no GPU run can start. `modal run` reaches
+`ConflictError: workspace ac-V3ivE6YpiVVa1aMm8dXDW8 is disabled`, which is an account/billing
+state, not a code fault. Nothing was billed for GPU — the failure lands after the image
+build and before any container is allocated.
+
+The image build itself **succeeded**, including the new SageAttention kernels
+(`sageattention ok /usr/local/lib/python3.12/site-packages/sageattention/__init__.py`,
+built in 148 s), so that layer is cached and the next attempt starts from a warm image.
+
+Two ways forward:
+
+- **Re-enable `tinof`.** Nothing to re-provision: the 22 GB SparkVSR weights, the SD 2.1
+  base and the operator-supplied `pisa_sr.pkl` are already on its volumes. This is the
+  cheap path and the assumed one.
+- **Move to the `ilias-fotiou` workspace**, which was checked and is enabled and writable.
+  This costs a re-provision: ~27 GB re-downloaded from HuggingFace via
+  `modal run -m modal_app.download_weights`, plus a manual
+  `modal volume put sparkvsr-models ./pisa_sr.pkl pisasr/pisa_sr.pkl` — that file has no
+  public programmatic source, but a local copy exists at the repo root.
+
+Every command below assumes `MODAL_PROFILE=tinof`; the local default profile is
+`ilias-fotiou`, and running the ladder under it without re-provisioning fails on missing
+volumes.
 
 ## Your first job: run the validation ladder (~$4)
 
