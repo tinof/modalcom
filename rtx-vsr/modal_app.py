@@ -50,6 +50,12 @@ NVENC_SFE = os.getenv("MODAL_NVENC_SFE", "")
 # a second ffmpeg. Measured on RTX PRO 6000 at 4K: 35 fps vs 19.5 for the identical
 # quality point (p6 + fullres), because the 24.9 MB/frame host round-trip disappears.
 # This is what NVEncC does and why a consumer 4070 beats our pipeline.
+#
+# Was briefly disabled on 2026-08-18 because it emitted alternating-column striping on
+# every frame. That was not this path being wrong -- it was the missing
+# torch.cuda.synchronize() before Encode(), fixed in _flush below. Turning this off is a
+# ~6x throughput cut, so do not reach for it as a workaround; run
+# scripts/probe_p010_encode.py instead, which reproduces the class of bug in minutes.
 GPU_ENCODER = os.getenv("MODAL_GPU_ENCODER", "1") == "1"
 # The last host round-trip: decode in-process with NVDEC so frames reach VSR as CUDA
 # tensors instead of crossing a rawvideo pipe from a decode subprocess. The pipe carries
@@ -58,6 +64,15 @@ GPU_ENCODER = os.getenv("MODAL_GPU_ENCODER", "1") == "1"
 # any input NVDEC cannot handle.
 GPU_DECODER = os.getenv("MODAL_GPU_DECODER", "1") == "1"
 MAX_PIXELS = 1024 * 1024 * 16
+# Frames per inference batch, capped independently of output size.
+#
+# 1 is the measured optimum, not a workaround. Batching briefly looked like the cause of
+# frame corruption; the real cause was the missing encoder sync in _flush, and with that
+# fixed a batch of 2 is equally clean (verified 2026-08-19: Laplacian 1.07, 301/301
+# frames). Batching just does not pay -- warm on the reference clip, batch=1 measured
+# 56.0 fps against batch=2's 53.2, because a larger batch makes the encoder wait on a
+# longer run of inference rather than overlapping with it.
+MAX_BATCH = int(os.getenv("MODAL_MAX_BATCH", "1")) or None
 MAX_OUTPUT_EDGE = 16384
 MAX_VSR_EDGE = 15360
 JOBS_DIR = Path("/jobs")
@@ -130,6 +145,7 @@ gpu_image = (
         "MODAL_NVENC_SFE": NVENC_SFE,
         "MODAL_GPU_ENCODER": "1" if GPU_ENCODER else "0",
         "MODAL_GPU_DECODER": "1" if GPU_DECODER else "0",
+        "MODAL_MAX_BATCH": str(MAX_BATCH or 0),
     })
 )
 
@@ -313,7 +329,8 @@ def _check_frame_integrity(
 
 def _batch_size_for_output(output_width: int, output_height: int) -> int:
     out_pixels = output_width * output_height
-    return max(1, MAX_PIXELS // out_pixels)
+    size = max(1, MAX_PIXELS // out_pixels)
+    return min(size, MAX_BATCH) if MAX_BATCH else size
 
 
 def _encoder_works(encoder: str, extra_args: tuple[str, ...] = ()) -> bool:
@@ -926,7 +943,20 @@ class UpscaleWorker:
             infer_seconds += time.perf_counter() - infer_start
             encode_start = time.perf_counter()
             for frame_rgb in upscaled:
-                packet_count += _mux(encoder.Encode(_rgb_to_p010(frame_rgb)))
+                p010 = _rgb_to_p010(frame_rgb)
+                # NVENC reads this surface from the encoder ASIC, which takes no part in
+                # CUDA stream ordering: it can start reading before the conversion kernels
+                # above have run. Without this sync it encoded half-written surfaces --
+                # measured as alternating-column striping on every frame, because the
+                # freed uint16 buffer was recycled for the next frame's int32 `packed`
+                # tensor and int32 read as uint16 is [value, 0, value, 0, ...].
+                #
+                # Reproduced and fixed in scripts/probe_p010_encode.py (variants I vs N):
+                # same code, sync alone turns 22 corrupt frames of 30 into 0. Holding the
+                # buffer alive instead does NOT work (variants K/L/M) -- the race is
+                # against the kernels filling it, not against the allocator.
+                torch.cuda.synchronize()
+                packet_count += _mux(encoder.Encode(p010))
             encode_seconds += time.perf_counter() - encode_start
             rgb_batch.clear()
 

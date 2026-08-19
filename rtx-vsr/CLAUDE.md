@@ -165,6 +165,8 @@ n-panel comparison grids used for these judgements; both take `--variants label=
 | `probe_gpu_encoder.py` | Re-testing which `CreateEncoder` kwargs are live. One encoder session per container — see section 6. |
 | `probe_gpu_pipeline.py` | Re-testing the NVDEC decoder and rate control on real content. |
 | `probe_nvdec.py` | Re-testing decoder classes after a PyNvVideoCodec upgrade (is `ThreadedDecoder` fixed yet?). |
+| `probe_nvdec_rgb.py` | Re-testing the NVDEC `OutputColorType.RGB` path and its surface layout. |
+| `probe_p010_encode.py` | Any suspicion of corrupt GPU-encoder output — striping, stale or flat frames. See the sync bug below. |
 | `verify_roundtrip.py` | Running the deployed worker on a Volume-staged job, warm, without proxy tokens. |
 
 The probes are standalone by design (own image, no `import modal_app`) and cost a few
@@ -493,12 +495,54 @@ arguments and nothing else — the app imported cleanly for the entire period wh
    (`ffprobe`), and the worker log says `Selected video encoder: hevc_nvenc` — not `libx264`.
 5. `ffprobe` on that output reports `Main 10` / `yuv420p10le` and bt709 for **all three** of
    `color_space`, `color_primaries`, `color_transfer` — `unknown` on any of them is a bug.
-6. The `Video done: …` line reports `nvdec=in-process`, `gpu-encoder=yes`, and fps in line
-   with the table in section 6 (~59 fps warm on the reference clip). `nvdec=yes` means the
-   in-process decoder was skipped; `gpu-encoder` absent means the piped encoder ran.
-   Either is a silent downgrade worth explaining before shipping.
-7. `modal app logs rtx-media-upscaler` shows no warnings or tracebacks.
-8. `/health` returns 401 without proxy-auth headers.
+6. **Pixels are actually inspected.** Steps 4 and 5 all passed while the GPU encoder was
+   emitting visibly corrupt video — see the warning below. Two cheap checks catch it:
+   - **No flat frames.** Decode every frame small (`-vf scale=320:180 -f rawvideo
+     -pix_fmt gray`) and count frames whose per-frame standard deviation is > 1. Anything
+     below the full frame count means frames encoded as flat grey.
+   - **No striping.** Mean absolute Laplacian of a 512px crop from a mid-clip frame,
+     extracted with `-pix_fmt rgb24` (without it, ffmpeg writes 16-bit PNGs from the
+     10-bit stream). It should land near the source's own value (~1-3 on the reference
+     clip). ~190 means alternating-column striping, i.e. the P010 surface walked as 8-bit.
+7. The `Video done: …` line reports `nvdec=in-process`, `gpu-encoder=yes`, and fps in line
+   with the table in section 6 (~56-60 fps warm on the reference clip). `nvdec=yes` means
+   the in-process decoder was skipped; `gpu-encoder` absent means the piped encoder ran.
+   Either is a silent ~6x downgrade worth explaining before shipping.
+8. `modal app logs rtx-media-upscaler` shows no warnings or tracebacks.
+9. `/health` returns 401 without proxy-auth headers.
+
+### NVENC does not observe CUDA stream ordering — fixed 2026-08-19
+
+The GPU encode path spent a day disabled because it emitted alternating-column striping on
+every frame (Laplacian ~192 over a 512px crop against ~1.1 piped and ~2.0 for the source;
+raw pixels alternating 177, 59, 177, 61, …), plus flat grey frames whenever the inference
+batch exceeded 1. **Both were one bug**, and it was not in any of the places it looked
+like: `_flush` called `encoder.Encode(_rgb_to_p010(frame_rgb))` with no synchronisation
+between the conversion kernels and the encoder.
+
+NVENC reads the input surface from the encoder ASIC, which takes no part in CUDA stream
+ordering, so it can start reading before the kernels filling that surface have run. The
+striping is the tell: the freed uint16 P010 block gets recycled for the next frame's int32
+`packed` tensor, and int32 data read as uint16 is `[value, 0, value, 0, …]`. The piped
+path never showed it only because its `.cpu()` download synchronises the device every
+frame. Fix is one `torch.cuda.synchronize()` before `Encode()`.
+
+Things that were *not* the cause, each disproved by probe, so nobody re-runs them: the
+`__dlpack__` shim, the flat-vs-per-plane surface handoff, the non-contiguous CHW→HWC
+tensor production feeds in, batching itself, and holding the P010 buffer alive (rings of
+8/48/64 all still corrupt — the race is against the kernels filling the buffer, not
+against the allocator).
+
+**`scripts/probe_p010_encode.py` is the tool for this class of bug.** It encodes a smooth
+synthetic clip, muxes it exactly like production, decodes it back and reports the striping
+Laplacian and a stale-frame count, one encoder session per container. Variants I (freed
+temporary, production's old lifetime) and N (same plus the sync) are the before/after:
+22 corrupt frames of 30 versus 0. `scripts/probe_gpu_encoder.py` cannot see any of this —
+it only watches the encoded size.
+
+The lasting lesson is verification, not encoders: for a full day this path produced
+visibly broken 4K while passing frame count, `ffprobe`, a clean decode with zero errors,
+and `_check_frame_integrity`. Only looking at pixels caught it — hence step 6 above.
 
 For GPU-level questions (does this library load? does this encoder exist? which encoder
 option costs the throughput?), write a small throwaway `modal run` script that probes the
