@@ -1,0 +1,1 @@
+"""SparkVSR Modal application package."""

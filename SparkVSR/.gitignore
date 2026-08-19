@@ -1,0 +1,7 @@
+pisa_sr.pkl
+sample/out_*.mp4
+sample/bench_*.mkv
+sample/*_restored.*
+__pycache__/
+.ruff_cache/
+.DS_Store
