@@ -57,12 +57,22 @@ same resolution, no upscale. It recovers 7–9x the source's high-frequency deta
 (Laplacian variance 23 → 163–211) at ~4.6x less GPU time than upscaling to 4K. Defaults
 in `config.py` reflect this; 4K is still available via `--target-height 2160`.
 
-## Blocker: the `tinof` Modal workspace is disabled
+## Blocker: the `tinof` workspace has exceeded its spend limit
 
-As of 2026-08-19 no GPU run can start. `modal run` reaches
-`ConflictError: workspace ac-V3ivE6YpiVVa1aMm8dXDW8 is disabled`, which is an account/billing
-state, not a code fault. Nothing was billed for GPU — the failure lands after the image
-build and before any container is allocated.
+As of 2026-08-19 no GPU run can start. `modal run` fails with:
+
+```
+Workspace ac-V3ivE6YpiVVa1aMm8dXDW8 has exceeded its spend limit
+```
+
+(An earlier attempt surfaced the same condition as `ConflictError: workspace ... is
+disabled`, so both messages mean this.) It is an account state, not a code fault — raise the
+limit under Settings → Spend limit in the Modal dashboard for the `tinof` workspace.
+
+Nothing was billed for GPU: the failure lands after the image build and before any container
+is allocated. Volume *reads* still succeed while in this state, so `modal volume list`
+working is not evidence that the workspace can run anything — test with an actual `modal
+run`, which now fails in under a minute against the cached image.
 
 The image build itself **succeeded**, including the new SageAttention kernels
 (`sageattention ok /usr/local/lib/python3.12/site-packages/sageattention/__init__.py`,
