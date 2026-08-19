@@ -79,7 +79,30 @@ TORCH_COMPILE_VAE = _env_flag("SPARKVSR_TORCH_COMPILE_VAE", False)
 # FP8 dynamic quantisation of the transformer's linear layers via torchao. Blackwell has
 # native FP8 tensor cores. This is the one knob that can change output quality, so it stays
 # off until an A/B on real frames justifies it.
+#
+# Note torchao's *int8* weight-only path is deliberately not offered: the CogVideoX model
+# card is explicit that it trades speed for VRAM ("using an INT8 model reduces inference
+# speed"), and VRAM is not this project's constraint.
 FP8_QUANTIZE = _env_flag("SPARKVSR_FP8", False)
+
+# Attention implementation for the transformer, as a diffusers attention-dispatcher backend
+# name. "native" is PyTorch SDPA, the default everything so far was measured against.
+#
+# "sage" is the interesting one: SageAttention quantises QK to INT8 and PV to FP8, and
+# upstream benchmarks it on CogVideoX1.5-5B — this project's exact backbone — at 12'07"
+# against FlashAttention2's 25'34" end to end (H20). Unlike step-caching tricks (TeaCache,
+# PAB), which have nothing to cache in a one-step model, an attention win applies in full to
+# a single forward pass. It changes numerics, so it needs the same quality gate as FP8.
+#
+# Useful values: native | sage | sage_hub | _sage_qk_int8_pv_fp8_cuda | _native_cudnn.
+# An unavailable backend degrades to native with a printed reason rather than failing.
+ATTENTION_BACKEND = os.environ.get("SPARKVSR_ATTENTION_BACKEND", "native").strip()
+
+# VAE slicing and tiling. Both are memory optimisations that cost throughput, and they were
+# enabled unconditionally before any measurement. Peak VRAM at 1080p is 25.9 GB against the
+# card's 96 GB, so there is likely nothing to buy here. Kept as a knob because 4K
+# (49.1 GB peak measured *with* tiling) has much less headroom.
+VAE_TILING = _env_flag("SPARKVSR_VAE_TILING", True)
 
 # Emit a torch.profiler trace for the first window, then exit that window early. Used once
 # to attribute inference time across VAE-encode / transformer / attention / VAE-decode.

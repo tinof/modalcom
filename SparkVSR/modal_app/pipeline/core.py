@@ -30,6 +30,7 @@ from diffusers import CogVideoXDPMScheduler, CogVideoXImageToVideoPipeline
 from diffusers.models.embeddings import get_3d_rotary_pos_embed
 
 from ..config import (
+    ATTENTION_BACKEND,
     DEFAULT_SR_NOISE_STEP,
     EMPTY_PROMPT_EMBED_PATH,
     FP8_QUANTIZE,
@@ -37,6 +38,7 @@ from ..config import (
     TORCH_COMPILE,
     TORCH_COMPILE_MODE,
     TORCH_COMPILE_VAE,
+    VAE_TILING,
 )
 
 
@@ -274,11 +276,15 @@ class SparkVSRPipeline:
 
         pipeline.to("cuda")
 
-        # Enable VAE slicing and tiling for memory efficiency
-        if hasattr(pipeline.vae, "enable_slicing"):
-            pipeline.vae.enable_slicing()
-        if hasattr(pipeline.vae, "enable_tiling"):
-            pipeline.vae.enable_tiling()
+        # VAE slicing and tiling trade throughput for peak memory. Off is faster; on is what
+        # 4K was measured with. See VAE_TILING in config.py.
+        if VAE_TILING:
+            if hasattr(pipeline.vae, "enable_slicing"):
+                pipeline.vae.enable_slicing()
+            if hasattr(pipeline.vae, "enable_tiling"):
+                pipeline.vae.enable_tiling()
+        else:
+            print("VAE slicing/tiling disabled (SPARKVSR_VAE_TILING=0).")
 
         print(f"Loading empty-prompt embedding from {embed_path}...")
         empty_prompt_embeds = torch.load(embed_path, map_location="cuda", weights_only=True)
@@ -290,16 +296,84 @@ class SparkVSRPipeline:
         return cls(pipeline, empty_prompt_embeds)
 
 
-def _apply_inference_optimizations(pipeline) -> None:
-    """Apply FP8 quantisation and torch.compile to the loaded pipeline, in that order.
+_ORIGINAL_SDPA = F.scaled_dot_product_attention
 
-    Order matters: torchao swaps the linear layers, so quantising after compiling would
-    invalidate the compiled graph.
+# Whether the SDPA replacement below should defer to the quantised kernel. Only ever true
+# inside sage_attention(), so the swap reaches the SparkVSR transformer and nothing else --
+# notably not PiSA-SR's SD 2.1 UNet, which runs in the same process after this pipeline
+# loads and whose output feeds the quality comparison.
+_SAGE_ACTIVE = False
+
+
+def _apply_attention_backend(pipeline) -> None:
+    """Install SageAttention under torch's SDPA entry point, if requested.
+
+    Not via diffusers' set_attention_backend: CogVideoXAttnProcessor2_0 calls
+    F.scaled_dot_product_attention directly and never reaches the attention dispatcher, so
+    setting a dispatcher backend on this transformer succeeds and changes nothing. Swapping
+    SDPA is the integration SageAttention documents for CogVideoX, and the only one that
+    actually takes effect here.
+    """
+    backend = ATTENTION_BACKEND
+    if not backend or backend == "native":
+        return
+
+    if backend != "sage":
+        print(f"Unknown SPARKVSR_ATTENTION_BACKEND {backend!r}, continuing native.")
+        return
+
+    try:
+        from sageattention import sageattn
+    except Exception as e:  # noqa: BLE001 - never block startup on an optimisation
+        print(f"SageAttention unavailable, continuing on torch SDPA: {e}")
+        return
+
+    def _maybe_sage(query, key, value, attn_mask=None, dropout_p=0.0,
+                    is_causal=False, scale=None, enable_gqa=False):
+        # sageattn takes no mask, dropout or GQA, and it quantises to INT8/FP8. Anything it
+        # cannot express must fall through to real SDPA rather than be computed wrongly.
+        if (
+            not _SAGE_ACTIVE
+            or attn_mask is not None
+            or dropout_p != 0.0
+            or enable_gqa
+            or scale is not None
+        ):
+            return _ORIGINAL_SDPA(
+                query, key, value, attn_mask=attn_mask, dropout_p=dropout_p,
+                is_causal=is_causal, scale=scale, enable_gqa=enable_gqa,
+            )
+        # Diffusers hands SDPA [batch, heads, seq, dim], which sageattn calls "HND".
+        return sageattn(query, key, value, tensor_layout="HND", is_causal=is_causal)
+
+    F.scaled_dot_product_attention = _maybe_sage
+    print("SageAttention installed over torch SDPA (active in the transformer forward).")
+
+
+@contextlib.contextmanager
+def sage_attention():
+    """Enable the SageAttention SDPA replacement for the duration of the block."""
+    global _SAGE_ACTIVE
+    previous = _SAGE_ACTIVE
+    _SAGE_ACTIVE = True
+    try:
+        yield
+    finally:
+        _SAGE_ACTIVE = previous
+
+
+def _apply_inference_optimizations(pipeline) -> None:
+    """Apply the attention backend, FP8 quantisation and torch.compile, in that order.
+
+    Order matters: torchao swaps the linear layers and the attention swap replaces module
+    internals, so doing either after compiling would invalidate the compiled graph.
 
     Every step degrades gracefully. An optimisation that fails to apply prints why and
     leaves the pipeline in its previous working state, because a slower correct render
     beats a container that will not start.
     """
+    _apply_attention_backend(pipeline)
+
     if FP8_QUANTIZE:
         try:
             from torchao.quantization import (
@@ -472,14 +546,15 @@ def process_video_ref_i2v(
             ofs = torch.full((latents.shape[0],), fill_value=2.0, device=device, dtype=dtype)
 
         # 9. Single transformer forward
-        predicted_noise = pipe.transformer(
-            hidden_states=latents,
-            encoder_hidden_states=prompt_embedding,
-            timestep=timesteps,
-            image_rotary_emb=rotary_emb,
-            ofs=ofs,
-            return_dict=False,
-        )[0]
+        with sage_attention():
+            predicted_noise = pipe.transformer(
+                hidden_states=latents,
+                encoder_hidden_states=prompt_embedding,
+                timestep=timesteps,
+                image_rotary_emb=rotary_emb,
+                ofs=ofs,
+                return_dict=False,
+            )[0]
 
         # 10. Recover the clean latent via the velocity parameterization
         predicted_noise_slice = predicted_noise[:, :, :16, :, :].transpose(1, 2)

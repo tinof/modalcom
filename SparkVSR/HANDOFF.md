@@ -117,15 +117,47 @@ workers you pay it 10 times, so a 2-minute warmup against a 3-minute segment is 
 trade. If warmup is large, raise `SPARKVSR_SEGMENT_FRAMES` so each worker amortizes it
 over more windows.
 
-### Step 4 — FP8 (~$0.36)
+### Step 4 — VAE tiling off (~$0.30)
+
+```bash
+SPARKVSR_VAE_TILING=0 modal run run_sample.py --input-file sample/bench_5s.mkv \
+    --ref-mode no_ref --no-parallel --output-file sample/bench_notile.mp4
+```
+
+VAE slicing and tiling were enabled unconditionally before anything was measured. They buy
+peak memory at the cost of throughput, and 1080p peaked at 25.9 GB against this card's 96 GB
+— so there was probably nothing to buy. This is also the knob FastVSR's finding points at:
+in a one-step model the denoiser runs once, which pushes the VAE codec's share of the
+forward up sharply.
+
+Numerically identical output, so no quality gate. Keep it off if it is faster **and** peak
+VRAM stays comfortably under 96 GB. Note that 4K peaked at 49.1 GB *with* tiling on, so this
+decision may not carry from 1080p to 4K — re-check before changing the 4K default.
+
+### Step 5 — SageAttention (~$0.36)
+
+```bash
+SPARKVSR_ATTENTION_BACKEND=sage modal run run_sample.py \
+    --input-file sample/bench_5s.mkv --ref-mode no_ref --no-parallel \
+    --output-file sample/bench_sage.mp4
+```
+
+Stack this on whatever steps 3–4 selected. Confirm the log line
+`SageAttention installed over torch SDPA` appears — without it the kernels did not import
+and the run is measuring nothing. Quality gate below applies (INT8 QK, FP8 PV).
+
+### Step 6 — FP8 (~$0.36)
 
 ```bash
 SPARKVSR_FP8=1 modal run run_sample.py --input-file sample/bench_5s.mkv \
     --ref-mode no_ref --no-parallel --output-file sample/bench_fp8.mp4
 ```
 
-FP8 is the **only knob that can change output quality**, so this one needs a quality check,
-not just a timing check. Compare against `bench_base.mp4`:
+### Quality gate for steps 5 and 6
+
+Both change numerics, so both need a frame-level check, not just a timing check. Compare the
+run's output against `bench_base.mp4` (substitute `bench_sage.mp4` for the SageAttention
+run):
 
 ```bash
 python3 - <<'EOF'
@@ -145,11 +177,12 @@ for i in a:
 EOF
 ```
 
-Keep FP8 only if Laplacian variance stays within a few percent **and** mean absolute
-difference is small (single-digit on 0–255). Otherwise leave `SPARKVSR_FP8=0`; the speed
-is not worth degrading the detail recovery that is this project's whole point.
+Keep the knob only if Laplacian variance stays within a few percent **and** mean absolute
+difference is small (single-digit on 0–255). Otherwise leave it off; the speed is not worth
+degrading the detail recovery that is this project's whole point. SageAttention's paper
+claims under 0.2% end-to-end metric loss, which is a reason to test it, not to trust it.
 
-### Step 5 — parallel smoke (~$0.52)
+### Step 7 — parallel smoke (~$0.52)
 
 First real exercise of the fan-out path. **Nothing in it has ever executed.**
 
@@ -175,9 +208,9 @@ Pass criteria: 301 frames, `hevc`, `yuv420p10le`, `bt709`, `25/1`, AAC audio pre
 Then compare against `sample/out_1080_pisa.mp4` from the earlier session — the parallel
 output should be equivalent, since segments split only on shot boundaries.
 
-### Step 6 — full validation (~$2.28)
+### Step 8 — full validation (~$2.28)
 
-With whatever configuration steps 2–4 selected:
+With whatever configuration steps 2–6 selected:
 
 ```bash
 modal run run_sample.py --input-file sample/jopet_60s.mkv \
@@ -187,7 +220,7 @@ modal run run_sample.py --input-file sample/jopet_60s.mkv \
 Must produce **1551 frames**. Compare wall clock and steady-state median against the
 recorded 1912 s / 1551-frame baseline from the previous session.
 
-### Step 7 — close the loop
+### Step 9 — close the loop
 
 Update the README's cost table and "Performance & Cost Profile" with measured numbers, then
 check off 11.11 and 11.12 in `openspec/changes/add-sparkvsr-modal-service/tasks.md`. After
@@ -227,16 +260,29 @@ takes, this needs a real fix: per-window on-demand decode via decord random acce
 removes the whole-segment uint8 hold. That is the highest-value piece of remaining work
 after the ladder.
 
-**The 2–3x speedup is an estimate.** It is the product of unverified compile and FP8
-assumptions. Do not quote it to anyone until step 3 and 4 produce numbers.
+**The 2–3x speedup is an estimate.** It is the product of unverified compile, FP8 and
+SageAttention assumptions. Do not quote it to anyone until steps 3–6 produce numbers.
 
 **Parallelism divides wall clock, not cost.** Ten workers cost the same as one worker
 running ten times as long. Only the single-GPU knobs reduce the bill. Worth restating
 whenever someone asks why the invoice did not move.
 
-**SageAttention was deliberately skipped.** It needs compiling from source with uncertain
-sm_120 wheel availability, and debugging an untestable build was a bad trade. Revisit only
-if step 1 shows attention dominating and compile alone disappoints.
+**SageAttention is now wired in** (`SPARKVSR_ATTENTION_BACKEND=sage`), reversing the earlier
+decision to skip it. The blocker was believed to be sm_120 wheel availability; that was
+stale. Upstream's `setup.py` has an explicit `12.0 -> sm_120a` branch, requires nvcc >= 12.8,
+and honours `TORCH_CUDA_ARCH_LIST`, so it builds on a GPU-free builder. The GPU image
+therefore moved to a CUDA 13.0.1 *devel* base — the same base flashvsr-pro already runs on
+this GPU — and compiles the kernels for sm_120 only.
+
+Two things about that wiring are worth not rediscovering:
+
+- It replaces `F.scaled_dot_product_attention`, **not** `set_attention_backend`.
+  `CogVideoXAttnProcessor2_0` calls SDPA directly and never reaches diffusers' attention
+  dispatcher, so setting a dispatcher backend on this transformer succeeds and does nothing.
+  That failure mode is invisible — it looks exactly like "SageAttention gave no speedup".
+- The replacement is scoped to the transformer forward via `sage_attention()`. PiSA-SR runs
+  in the same process *after* the pipeline loads, so an unscoped patch would also quantise
+  the reference keyframes and contaminate the very comparison used to judge the knob.
 
 **Cost estimates come from Modal's published rates**, not from an invoice. Check the
 billing page once real runs land.

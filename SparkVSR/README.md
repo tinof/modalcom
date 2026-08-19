@@ -199,11 +199,36 @@ variables, so a run can A/B one knob without a code change.
 | `SPARKVSR_TORCH_COMPILE` | `1` | `torch.compile` the transformer. Costs a one-off graph build on a container's first window |
 | `SPARKVSR_TORCH_COMPILE_MODE` | `max-autotune-no-cudagraphs` | Compile mode |
 | `SPARKVSR_TORCH_COMPILE_VAE` | `0` | Also compile VAE decode. Recompiles more often because window length varies |
-| `SPARKVSR_FP8` | `0` | FP8 dynamic quantisation of the transformer's linears (torchao, Blackwell-native). The only knob that can change output quality |
+| `SPARKVSR_FP8` | `0` | FP8 dynamic quantisation of the transformer's linears (torchao, Blackwell-native). Changes output quality |
+| `SPARKVSR_ATTENTION_BACKEND` | `native` | `sage` swaps in SageAttention (INT8 QK, FP8 PV) for the transformer forward. Changes output quality |
+| `SPARKVSR_VAE_TILING` | `1` | VAE slicing and tiling. Memory optimisations that cost throughput; `0` is faster where VRAM allows |
 | `SPARKVSR_PROFILE` | `0` | Emit a `torch.profiler` CUDA breakdown for the first window |
 | `SPARKVSR_PARALLEL` | `1` | Fan segments across GPU workers |
 | `SPARKVSR_SEGMENT_FRAMES` | `500` | Frames per parallel segment |
 | `SPARKVSR_MAX_CONTAINERS` | `10` | Ceiling on simultaneous GPU workers |
+
+Both quality-affecting knobs (`SPARKVSR_FP8`, `SPARKVSR_ATTENTION_BACKEND=sage`) must clear a
+frame-level comparison against a `native` render before being enabled by default — detail
+recovery is the point of this pipeline, and a knob that erodes it is not a win.
+
+### Attention backends
+
+SageAttention quantises QK to INT8 and PV to FP8. Upstream benchmarks it on CogVideoX1.5-5B,
+this project's exact backbone, at 12'07" end to end against FlashAttention2's 25'34" (H20).
+Because SparkVSR denoises in a single step, there is no timestep loop to cache across — the
+step-caching family (TeaCache, PAB) has nothing to work with — but an attention win applies
+in full to every forward pass.
+
+It is wired by replacing `torch.nn.functional.scaled_dot_product_attention`, **not** through
+diffusers' `set_attention_backend`. CogVideoX's attention processor calls SDPA directly and
+never reaches the attention dispatcher, so a dispatcher backend would apply cleanly and
+change nothing. The replacement is active only inside the transformer forward, so PiSA-SR's
+UNet — which runs later in the same process — keeps stock attention, and any call carrying a
+mask, a custom scale, dropout or GQA falls through to real SDPA rather than being quantised
+into a wrong answer.
+
+The kernels are compiled into the GPU image for `sm_120` (see `modal_app/image.py`), which is
+why that image is built on a CUDA devel base.
 
 ### Parallelism
 
