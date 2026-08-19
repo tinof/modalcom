@@ -67,23 +67,178 @@ Encoder settings mirror the reference NVEncC invocation
 10-bit encoding is used even for 8-bit sources because it costs nothing on NVENC and keeps
 upscaled gradients from banding.
 
-Measured on RTX PRO 6000, 1080p→4K, `HIGHBITRATE_ULTRA`, warm containers:
+## Performance
 
-| Data path | fps |
+All numbers below are measured on RTX PRO 6000, 1080p→4K, `HIGHBITRATE_ULTRA`, warm
+containers, on a 301-frame reference clip. Read the measurement rules at the end of this
+section before you compare any new number against them.
+
+### What the data path is worth
+
+| Data path | fps | Frames out |
+|---|---|---|
+| rawvideo pipes to and from ffmpeg (original) | 12.1 | 296 of 301 |
+| GPU encode, piped decode | 34.2 | 301 of 301 |
+| **fully GPU-resident (current default)** | **56–60** | **301 of 301** |
+
+The 4.8x gain came from deleting host round-trips, not from making any stage faster. The
+piped path moved about 31 MB per frame across three processes (6.2 MB in, 24.9 MB out).
+
+### Where the time goes now
+
+| Stage | Share of wall time |
 |---|---|
-| rawvideo pipes to/from ffmpeg (original) | 12.1 |
-| GPU encode, piped decode | 34.2 |
-| **fully GPU-resident (current default)** | **≈59** |
+| Super-resolution inference | 74% |
+| NVENC encode | 11–12% |
+| NVDEC decode wait | 1% |
 
-Each job logs a line like `Video done: 301 frames in 5.1s = 58.8 fps (decode-wait 1%,
-infer 74%, encode 11%; nvdec=in-process, batch=2, gpu-encoder=yes)` — useful for spotting a
-regression or a silent fallback. The binding stage is now super-resolution inference; the
-encoder sits around 11%.
+Each job logs a line like `Video done: 301 frames in 5.4s = 56.0 fps (decode-wait 1%,
+infer 74%, encode 11%; nvdec=in-process, batch=1, gpu-encoder=yes)`. Use it to spot a
+regression or a silent fallback.
+
+### Each stage measured alone
+
+These explain why the current path is inference-bound, and why encoder tuning buys nothing.
+
+| Stage, measured in isolation | fps |
+|---|---|
+| Super-resolution `run()`, GPU-resident | 310 |
+| plus the mandatory `.clone()` and integrity check | 262 |
+| plus host upload and download | 103 |
+| `hevc_nvenc` with production arguments, fed from a pipe | 19.5 |
+| `hevc_nvenc` with production arguments, fed from CUDA memory | 35 |
+| NVDEC decode | effectively free |
+| bt709 colour filter | free (214 fps with it, 215 without) |
+
+Inference alone runs at about 26x realtime for 25 fps content. The consumer RTX VSR
+overlay is realtime because it renders to screen. This service also writes an archival 4K
+10-bit HEVC file, which is the extra work.
+
+### Settings that do not change throughput
+
+Do not spend effort on these. Each was measured and each is flat.
+
+- **Encoder preset.** Standalone the preset is a large lever (p6 21 fps, p5 31, p4 38.5,
+  p4 with quarter-resolution multipass 43). In the pipeline every setting measured
+  12.0–12.6 fps. Keep the preset for quality, not for speed.
+- **Quality rung.** Inference cost varies a lot in isolation (`HIGHBITRATE_ULTRA` 310 fps,
+  `ULTRA` 431, `HIGHBITRATE_LOW` and `LOW` about 1235). Since inference is not the limit
+  end to end, lowering quality buys no throughput.
+- **Batch size.** `MAX_BATCH` is 1. Batch 1 measured 56.0 fps against batch 2 at 53.2. A
+  larger batch makes the encoder wait on a longer run of inference instead of overlapping
+  with it.
+- **Encode threading.** Encode is 11–12% of wall time, so perfect overlap is worth about
+  1.14x at most. It also reintroduces packet-ordering and buffer-lifetime hazards.
+
+### Bitrate against the quality target
+
+Measured on real 1080p content. The NVENC key is `cq`, and it is monotonic in the expected
+direction.
+
+| `cq` | Bitrate |
+|---|---|
+| 14 | 7.79 Mbps |
+| 18 (current) | 7.44 Mbps |
+| 24 | 4.48 Mbps |
+| 32 | 1.60 Mbps |
+
+Output at the settled settings is 12.7 Mbps at 4K, below the piped path's 19.9 Mbps.
+
+### How to measure without fooling yourself
+
+1. **Compare warm containers only.** The same configuration measured 8.0 fps cold and
+   12 fps warm on a 12-second clip. The effect loads once per container. Run the clip
+   three or four times in one container and read the later runs.
+2. **Use real content.** On synthetic noise the `cq` response measured inverted.
+3. **Use one encoder session per container.** With several `CreateEncoder` calls in one
+   process the measurements are worthless. The same settings measured 17199 KiB and
+   7204 KiB on different runs, and every session after the first returned an identical
+   size whatever changed. `scripts/probe_gpu_encoder.py` runs each variant in its own
+   container for this reason.
+4. **Check the pixels, not only the metadata.** See the note below.
+
+### Speed is not correctness
+
+For a full day this path produced visibly striped 4K while passing frame count, `ffprobe`,
+a clean decode with zero errors, and the built-in integrity check. Two cheap checks catch
+that class of failure, and both belong in any benchmark run:
+
+- **Flat frames.** Decode every frame small and count frames whose standard deviation is
+  above 1. A count below the frame count means frames encoded as flat grey.
+- **Striping.** Take the mean absolute Laplacian of a 512-pixel crop. It should land near
+  the source value (1–3 on the reference clip). About 190 means column striping.
+
+`scripts/probe_p010_encode.py` runs both checks against a synthetic clip.
 
 Two escape hatches exist for inputs the GPU path cannot take. `MODAL_GPU_DECODER=0` falls
 back to a decode subprocess (this also happens automatically for codecs NVDEC cannot
 handle), and `MODAL_GPU_ENCODER=0` falls back to piping frames to ffmpeg. Both fallbacks
 use the same encoder quality point, and every degradation is logged with its cause.
+
+## Choosing a GPU
+
+The default is `RTX-PRO-6000`. Change it with `MODAL_GPU`.
+
+### Which Modal GPUs can run this job at all
+
+NVENC is a separate hardware engine from the CUDA cores. Several Modal GPUs have none.
+
+| GPU | NVENC engines | Usable for this service |
+|---|---|---|
+| RTX PRO 6000 (Blackwell) | Yes, 9th generation | Yes — current default |
+| L40S | Yes | Yes |
+| H100, H200, A100, B200, B300 | **None** | No — falls back to CPU `libx264` |
+
+A GPU with no NVENC still produces correct output, but it encodes on the CPU at roughly a
+tenth of the speed. Paying more for such a card buys less throughput, not more.
+
+### Cost per frame, not cost per second
+
+Throughput alone is the wrong measure. Compare cost per frame:
+
+    cost per frame = (GPU + CPU + memory cost per second) / fps
+
+Measured on a 302-frame clip, warm, **on the older piped architecture**:
+
+| Configuration | fps | Cost per second | Cost per frame |
+|---|---|---|---|
+| RTX PRO 6000, `cpu=12` | 11.7 | $0.001053 | $0.0000900 |
+| **RTX PRO 6000, `cpu=6`** (current) | **12.2** | **$0.000974** | **$0.0000798** |
+| RTX PRO 6000, `cpu=4` | 12.3 | $0.000948 | $0.0000771 |
+| L40S, `cpu=12` | 6.8 | $0.000753 | $0.0001107 |
+
+L40S is cheaper per second but loses on cost per frame: 56% of the throughput for 72% of
+the cost. It needed at least 71.5% of RTX throughput to break even. It is not broken — NGX
+loads and `hevc_nvenc` is selected — it is inference-bound at 75%.
+
+### Read this before the next GPU benchmark
+
+**The table above was measured on the piped architecture, when the pipeline ran at 12 fps
+and was bound by contention between processes. The current path is bound by
+super-resolution inference. The ranking may therefore change, and every row needs
+re-deriving before it is trusted.**
+
+Run a benchmark like this:
+
+1. Deploy a variant beside production instead of replacing it:
+   `MODAL_APP_NAME=rtx-bench-l40s MODAL_GPU=L40S modal deploy modal_app.py`.
+2. Set `MODAL_WORKER_MAX_CONTAINERS=1`. The autoscaler otherwise scales out rather than
+   packing a container, which hides what you are trying to measure.
+3. Run the same clip three or four times in one container. Read the later runs only.
+4. Record fps, the stage attribution from the `Video done:` line, and the output size.
+5. Run the two pixel checks above. A fast GPU that emits striped frames has not won.
+6. Compute cost per frame from Modal's current per-second price for that GPU, plus the CPU
+   and memory you requested.
+7. Stop the bench app when finished: `modal app stop rtx-bench-l40s -y`.
+
+Environment knobs exist for exactly this: `MODAL_APP_NAME`, `MODAL_GPU`,
+`MODAL_WORKER_CPU`, `MODAL_WORKER_MAX_CONTAINERS`, and `MODAL_MAX_BATCH`. Note that these
+are read at container import, so they must be baked into the image. A bare
+`MODAL_GPU=L40S modal deploy` in the deploying shell silently measures the default.
+
+Two constraints travel with the GPU choice. Blackwell is `sm_120` and needs
+`torch==2.13.0`. Torch 2.6 fails there with "no kernel image is available". And
+`DRIVER_VERSION` must match the host driver of whichever GPU you land on.
 
 ## Behaviour Contract & Safeguards
 

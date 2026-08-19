@@ -232,9 +232,34 @@ The takeaways, so nobody re-runs these experiments:
   and 12 fps warm — the effect load is paid once per container. Run the clip 3-4 times
   back to back in one process and read the later runs, or you will "measure" cold starts.
 
-### GPU choice and `cpu=` — settled 2026-08-18, do not re-litigate
+### GPU choice and `cpu=` — settled 2026-08-18 **on the piped path**; re-derive before reusing
 
-Measured on a 10 s reference clip (302 frames, 1080p→4K, `HIGHBITRATE_ULTRA`), warm:
+**Read this before the next GPU benchmark.** The table below was measured when the
+pipeline ran at 12 fps and was bound by contention between three processes. The current
+path is fully GPU-resident and bound by *inference* (`infer 74%`, encode 11%). The
+conclusion may still hold, but the numbers no longer describe the running system, so
+**re-derive every row before quoting it**. What does not need re-deriving is the NVENC
+engine count — that is a hardware fact, and it is what makes most Modal GPUs unusable here.
+
+Method for the re-run, so results are comparable:
+
+1. Deploy beside production, never over it:
+   `MODAL_APP_NAME=rtx-bench-<gpu> MODAL_GPU=<gpu> modal deploy modal_app.py`.
+2. Set `MODAL_WORKER_MAX_CONTAINERS=1`. The autoscaler scales *out* rather than packing a
+   container, which hides the effect you are measuring.
+3. Run the same clip 3-4 times in one container; read the later runs only (cold start is
+   8.0 fps against 12 fps warm on a 12 s clip).
+4. Record fps **and** the stage attribution from the `Video done:` line. A GPU that shifts
+   the bound from inference to encode changes which optimisations matter next.
+5. Run the step 6 pixel checks from the verification protocol. A fast GPU that emits
+   striped frames has not won.
+6. Compute **cost per frame**, not fps: `($/s for GPU + cpu + mem) / fps`.
+7. `modal app stop rtx-bench-<gpu> -y` when done.
+
+Remember the knobs are read at container import, so they must be baked in with `.env()`.
+A bare `MODAL_GPU=L40S modal deploy` measures the default and tells you nothing.
+
+Historical table (piped path, 302-frame clip, 1080p→4K, `HIGHBITRATE_ULTRA`, warm):
 
 | Config | warm fps | $/s (GPU+cpu+mem) | $/frame |
 |---|---|---|---|
@@ -243,7 +268,7 @@ Measured on a 10 s reference clip (302 frames, 1080p→4K, `HIGHBITRATE_ULTRA`),
 | RTX PRO 6000, `cpu=4` | 12.3 | 0.000948 | 0.0000771 |
 | L40S, `cpu=12` | 6.8 | 0.000753 | 0.0001107 |
 
-- **The GPU question is closed: keep `RTX-PRO-6000`.** It is the only Modal GPU with
+- **The GPU question was closed on the piped path: keep `RTX-PRO-6000`.** It is the only Modal GPU with
   9th-gen NVENC, and H100/H200/A100/B200/B300 have **zero** NVENC engines — paying more
   buys less. L40S is the only credible alternative and it loses on *both* axes: 56% of the
   throughput for 72% of the cost. It needed ≥71.5% of RTX throughput just to break even.
@@ -438,6 +463,13 @@ throughput **not at all** (5.1s either way) — the "wait" was overlapping GPU w
 stall. The thread is kept because the attribution is honest and it removes a real
 serialization risk at larger output sizes, but do not expect fps from it. The binding stage
 is now VSR inference; the encoder sits at 12%.
+
+**Batching does not pay — `MAX_BATCH = 1`, measured 2026-08-19.** Warm on the reference
+clip, batch=1 measured **56.0 fps against batch=2's 53.2**. A larger batch makes the
+encoder wait on a longer run of inference instead of overlapping with it. The constant
+also pins the batch for a correctness reason — see the cross-stream DLPack race in the
+encoder-sync section below — so do not raise it for either speed or memory reasons without
+re-reading both.
 
 **Decoupled encode threading — evaluated 2026-08-18, declined.** Video Codec SDK 13.1
 introduced a decoupled-queue architecture so NVDEC/CUDA/NVENC work on *different* frames
