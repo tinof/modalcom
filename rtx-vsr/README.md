@@ -15,7 +15,7 @@ You can:
 
 Two tiers, so GPU time is only billed while frames are actually being upscaled:
 
-- **Web tier** (`api`): a CPU-only FastAPI app. It streams the upload into a Modal Volume, spawns the GPU job, and serves the finished file. Handles up to 20 concurrent requests per container.
+- **Web tier** (`api`): a CPU-only FastAPI app. It uploads the request body to a Modal Volume through the Volume API (no mount), spawns the GPU job, and streams the finished file back. Handles up to 20 concurrent requests per container.
 - **GPU worker** (`UpscaleWorker`): a GPU class whose `@modal.enter()` warms CUDA and probes the NVENC encoder once per container. The super-resolution model stays loaded between jobs that share quality and output size.
 
 Because video jobs can run far longer than Modal's 150-second HTTP request limit, the API is asynchronous: `POST /upscale` returns a `call_id` immediately and `GET /result/{call_id}` returns 202 while pending, then the file.
@@ -56,93 +56,92 @@ safer default for MP4 playback.
 
 ## Video output format and throughput
 
-Video jobs run **entirely on the GPU**: NVDEC decodes in-process, super-resolution runs on
-the decoded CUDA tensor, and NVENC encodes straight from GPU memory. A frame is created in
-video memory and never touches the host until the finished packet comes back out. Output is
-**HEVC Main 10** (`yuv420p10le`) tagged bt709 for matrix, primaries and transfer.
+Video jobs run **entirely on the GPU**: NVDEC decodes, super-resolution runs on the decoded
+CUDA tensor, and NVENC encodes straight from GPU memory. Output is **HEVC Main 10**
+(`yuv420p10le`, Level 5.1 High tier) tagged bt709 for matrix, primaries and transfer.
 
-Encoder settings mirror the reference NVEncC invocation
-`--qvbr 18 --codec h265 --tune uhq --output-depth 10 --profile main10 --tier high
---multipass 2pass-quarter --aq --aq-strength 10 --bframes 5 --ref 5` at preset **P4**.
+### Default encoder settings
+
+Chosen by measurement on 2026-10-03 (BBC Blu-ray, 1080p→4K, `HIGHBITRATE_ULTRA`; details in
+[docs/PERF-HISTORY.md](docs/PERF-HISTORY.md)). The NVEncC equivalent is:
+
+    --qvbr 20 --codec h265 --preset p5 --tune uhq --output-depth 10 --profile main10
+    --tier high --level 5.1 --max-bitrate 100000 --multipass 2pass-full --aq
+    --aq-strength 10 --aq-temporal --bframes 5 --lookahead 32
+
+| Setting | Default | Why |
+|---|---|---|
+| Preset | `p5` | P6 and P7 add only 0.06–0.15 VMAF over P5 and cost about 30% more encode time. |
+| Multipass | `fullres` (2pass-full) | About 1.1 VMAF better than `qres` at the same bitrate. |
+| Tuning | `uhq` | 1.7 VMAF better than `hq` with 19% fewer bits. UHQ also enables NVENC's temporal filter and deeper lookahead; PyNvVideoCodec cannot set those separately. |
+| CQ | `20` | A file-size choice. CQ 18 measured about 80 Mbps (VMAF 94.3), CQ 24 about 35 Mbps (VMAF 91.3). |
+| Level / ceiling | `5.1` High, 100 Mbps | See below. Above 4096x2176 the driver picks the level. |
+
 10-bit encoding is used even for 8-bit sources because it costs nothing on NVENC and keeps
 upscaled gradients from banding.
 
+**The bitrate ceiling matters more than the preset.** PyNvVideoCodec zeroes `maxBitRate`
+whenever a CQ target is set, and the driver then applies its own VBR ceiling: about
+20 Mbps at Level 5.0, 32 Mbps at 5.1, 48 Mbps at 6.0. Before 2026-10-03 every 4K output
+hit that ceiling, so CQ 18 and CQ 24 produced the same file size. The driver also picked
+the level per session (5.0 or 6.0 for the same input), so the same job sometimes produced a
+2.4x larger file. The worker now sets Level 5.1 explicitly for outputs up to 4K and
+restores a 100 Mbps ceiling (1 s buffer) with `Reconfigure()` before the first frame. Expect output bitrate to follow the content:
+grainy 4K at CQ 20 lands roughly between 35 and 80 Mbps.
+
+### Interlace-flagged sources (UK/EU Blu-ray and broadcast)
+
+Many HD discs carry progressive 25p pictures in a 1080i container (PsF). PyNvVideoCodec
+creates its decoder in Adaptive deinterlace mode for any interlace-flagged stream, and that
+mode rewrote one field's rows on such a disc: 32% of vertical detail was gone before VSR saw
+the frame. The worker therefore decodes interlace-flagged inputs through ffmpeg's NVDEC
+path, which weaves the fields losslessly, and logs a warning saying so. That path converts
+to RGB with exact swscale flags (`accurate_rnd+full_chroma_int`; the default lookup tables
+sit about 1.6 luma levels dark), picks BT.709 for untagged HD, and passes frames through
+1:1. Truly interlaced 50i/60i video would need a real deinterlacer; that is not handled.
+
 ## Performance
 
-All numbers below are measured on RTX PRO 6000, 1080p→4K, `HIGHBITRATE_ULTRA`, warm
-containers, on a 301-frame reference clip. Read the measurement rules at the end of this
-section before you compare any new number against them.
+Measured on RTX PRO 6000 Blackwell Server Edition, 1080p→4K, `HIGHBITRATE_ULTRA`, warm
+containers. Read the measurement rules at the end of this section before you compare a
+new number against them.
 
-### What the data path is worth
+### The encoder is the limit
 
-| Data path | fps | Frames out |
-|---|---|---|
-| rawvideo pipes to and from ffmpeg (original) | 12.1 | 296 of 301 |
-| GPU encode, piped decode | 34.2 | 301 of 301 |
-| **fully GPU-resident (current default)** | **56–60** | **301 of 301** |
-
-The 4.8x gain came from deleting host round-trips, not from making any stage faster. The
-piped path moved about 31 MB per frame across three processes (6.2 MB in, 24.9 MB out).
-
-### Where the time goes now
-
-| Stage | Share of wall time |
+| Stage, measured alone | Speed |
 |---|---|
-| Super-resolution inference | 74% |
-| NVENC encode | 11–12% |
-| NVDEC decode wait | 1% |
+| VSR `run()` | 3.5 ms/frame (about 286 fps) |
+| VSR + integrity check + P010 conversion | 4.4 ms/frame |
+| NVENC, P4 + qres + UHQ | 65.0 fps |
+| **NVENC, P5 + 2pass-full + UHQ (default)** | **38.5 fps** |
+| NVENC, P5 + 2pass-full + HQ | 68.1 fps |
+| NVENC, P6 + 2pass-full + UHQ | 27.5 fps |
+| NVENC, P7 + 2pass-full + UHQ | about 24 fps |
 
-Each job logs a line like `Video done: 301 frames in 5.4s = 56.0 fps (decode-wait 1%,
-infer 74%, encode 11%; nvdec=in-process, batch=1, gpu-encoder=yes)`. Use it to spot a
-regression or a silent fallback.
+One encoder session is the bottleneck. With the defaults a job runs at about **36 fps** end
+to end (1080p→4K, warm): roughly 42 minutes of GPU time per hour of 25 fps video, about
+$2.40 at Modal's 2026-10 RTX PRO 6000 rate. On the 61-second Night Manager Blu-ray sample
+CQ 20 produced 78 Mbps, i.e. about 35 GB per hour of grainy 4K. Overlapping VSR with
+encode measured no faster, because the encoder is already busy all the time.
 
-### Each stage measured alone
+The card has **four NVENC engines** and one session uses one. Independent sessions scale:
+four P5 + HQ sessions measured 210 fps combined, four P6 + UHQ sessions 66 fps. Splitting a
+job into time chunks encoded in parallel is the next speed lever. It is not implemented yet.
+PyNvVideoCodec 2.2.0 exposes no split-frame encoding option, so a single session cannot
+spread one frame over several engines.
 
-These explain why the current path is inference-bound, and why encoder tuning buys nothing.
+Each job logs a line like `Video done: 1526 frames in 42.8s = 35.7 fps (decode-wait 1%,
+infer 34%, encode 54%; nvdec=yes, batch=1, gpu-encoder=yes)` (an interlace-flagged
+Blu-ray, hence `nvdec=yes`; progressive input shows `nvdec=in-process`). The `infer` share
+includes time spent waiting for the encoder to accept the next frame. Use it to spot a regression
+or a silent fallback. `nvdec=yes` is expected for interlace-flagged inputs.
 
-| Stage, measured in isolation | fps |
-|---|---|
-| Super-resolution `run()`, GPU-resident | 310 |
-| plus the mandatory `.clone()` and integrity check | 262 |
-| plus host upload and download | 103 |
-| `hevc_nvenc` with production arguments, fed from a pipe | 19.5 |
-| `hevc_nvenc` with production arguments, fed from CUDA memory | 35 |
-| NVDEC decode | effectively free |
-| bt709 colour filter | free (214 fps with it, 215 without) |
+### Earlier history
 
-Inference alone runs at about 26x realtime for 25 fps content. The consumer RTX VSR
-overlay is realtime because it renders to screen. This service also writes an archival 4K
-10-bit HEVC file, which is the extra work.
-
-### Settings that do not change throughput
-
-Do not spend effort on these. Each was measured and each is flat.
-
-- **Encoder preset.** Standalone the preset is a large lever (p6 21 fps, p5 31, p4 38.5,
-  p4 with quarter-resolution multipass 43). In the pipeline every setting measured
-  12.0–12.6 fps. Keep the preset for quality, not for speed.
-- **Quality rung.** Inference cost varies a lot in isolation (`HIGHBITRATE_ULTRA` 310 fps,
-  `ULTRA` 431, `HIGHBITRATE_LOW` and `LOW` about 1235). Since inference is not the limit
-  end to end, lowering quality buys no throughput.
-- **Batch size.** `MAX_BATCH` is 1. Batch 1 measured 56.0 fps against batch 2 at 53.2. A
-  larger batch makes the encoder wait on a longer run of inference instead of overlapping
-  with it.
-- **Encode threading.** Encode is 11–12% of wall time, so perfect overlap is worth about
-  1.14x at most. It also reintroduces packet-ordering and buffer-lifetime hazards.
-
-### Bitrate against the quality target
-
-Measured on real 1080p content. The NVENC key is `cq`, and it is monotonic in the expected
-direction.
-
-| `cq` | Bitrate |
-|---|---|
-| 14 | 7.79 Mbps |
-| 18 (current) | 7.44 Mbps |
-| 24 | 4.48 Mbps |
-| 32 | 1.60 Mbps |
-
-Output at the settled settings is 12.7 Mbps at 4K, below the piped path's 19.9 Mbps.
+The original pipeline piped rawvideo through two ffmpeg processes and ran at 12 fps.
+Keeping every frame on the GPU took it to 56–60 fps at the old P4 + qres settings. The
+full history, including the stage-isolation tables from that era, is in
+[docs/PERF-HISTORY.md](docs/PERF-HISTORY.md).
 
 ### How to measure without fooling yourself
 
@@ -310,12 +309,15 @@ shell at request time does nothing — it must be present on the `modal deploy` 
 |---|---|---|
 | `MODAL_GPU_ENCODER` | `1` | Encode from CUDA memory. `0` pipes rawvideo to ffmpeg instead. |
 | `MODAL_GPU_DECODER` | `1` | Decode in-process with NVDEC. `0` uses a decode subprocess. |
-| `MODAL_NVENC_PRESET` | `p4` | NVENC preset, `p1`–`p7`. |
-| `MODAL_NVENC_CQ` | `18` | Quality target, equivalent to NVEncC `--qvbr`. Lower is higher quality. |
-| `MODAL_NVENC_MULTIPASS` | `qres` | `qres` = 2pass-quarter, `fullres` = 2pass-full. |
+| `MODAL_NVENC_PRESET` | `p5` | NVENC preset, `p1`–`p7`. |
+| `MODAL_NVENC_CQ` | `20` | Quality target, equivalent to NVEncC `--qvbr`. Lower is higher quality and larger files. |
+| `MODAL_NVENC_MULTIPASS` | `fullres` | `qres` = 2pass-quarter, `fullres` = 2pass-full. |
+| `MODAL_NVENC_TUNING` | `uhq` | `uhq` or `hq`. UHQ is slower and better per bit. |
+| `MODAL_NVENC_LEVEL` | `5.1` | HEVC level for outputs up to 4096x2176. Set explicitly so the driver cannot pick one per session. Empty = driver picks. |
+| `MODAL_NVENC_MAX_MBPS` | `100` | VBR ceiling in Mbit/s, with a 1-second VBV buffer. `0` skips it and leaves the driver's default ceiling, which caps CQ (see above). |
 | `MODAL_NVENC_AQ_STRENGTH` | `10` | Adaptive quantisation strength, 1–15. |
 | `MODAL_NVENC_BFRAMES` | `5` | B-frames per GOP. |
-| `MODAL_NVENC_REFS` | `5` | Reference frames. |
+| `MODAL_NVENC_REFS` | `5` | Reference frames for the piped ffmpeg encoder (`-refs`). The GPU encoder leaves reference lists to the driver. |
 | `MODAL_GPU` | `RTX-PRO-6000` | Worker GPU type. |
 | `MODAL_APP_NAME` | `rtx-media-upscaler` | Deploy a variant beside production instead of replacing it. |
 
@@ -425,7 +427,7 @@ python modal_client.py \
 	--quality HIGH
 ```
 
-The client submits the job, polls until the worker finishes, and saves the output locally (`*_upscaled.png` or `*_upscaled.mp4`) unless `--output` is provided. Tune the wait with `--timeout` and `--poll-interval`.
+The client submits the job, polls until the worker finishes, and saves the output locally (`*_upscaled.png` or `*_upscaled.mp4`) unless `--output` is provided. Tune the wait with `--timeout` and `--poll-interval`. Transient network errors and proxy 502/503/504 answers are retried with backoff. If the client stops anyway, resume the same job with `--call-id <call_id>` (printed at submit time) instead of uploading again. The download goes to `<output>.part` and is renamed only when its size matches `Content-Length`.
 
 ## Direct API Usage
 
@@ -448,7 +450,7 @@ curl "https://<workspace>--rtx-media-upscaler-api.modal.run/result/fc-XXX" \
 	-o upscaled.png
 ```
 
-The output is deleted from the Volume once it has been downloaded.
+The output is deleted from the Volume once it has been downloaded; a second request returns 410. A failed job's files are deleted when it fails. Errors return JSON with a `detail` message: 400 for invalid parameters, 404 when the result has expired, 500 when upscaling failed.
 
 Health check:
 
@@ -465,7 +467,7 @@ The structure here is deliberately generic; only the upscaling logic is domain-s
 
 - The CPU web tier / GPU worker split, so GPU time is billed only for GPU work.
 - The job-queue API, which sidesteps the 150-second HTTP limit on web endpoints.
-- The `modal.Volume` file handoff and chunked upload streaming.
+- The `modal.Volume` file handoff: the web tier uses the Volume API (`batch_upload`, `read_file`, `remove_file`), only the GPU worker mounts it.
 - `requires_proxy_auth=True`, plus the client’s submit-and-poll loop.
 - `@modal.enter()` warming for anything expensive to initialise.
 
@@ -483,4 +485,4 @@ The structure here is deliberately generic; only the upscaling logic is domain-s
 ## Compatibility Notes
 
 - The runtime contract is HTTP upload/download.
-- Video output is encoded with NVENC HEVC/H.264 when the GPU encoder is available (falling back to `libx264`), and the source audio track is copied through unchanged.
+- Video output is encoded with NVENC HEVC/H.264 when the GPU encoder is available (falling back to `libx264`), and **every** source audio track is kept. Each track is stream-copied when mp4 can carry its codec (AAC, AC-3, E-AC-3, Opus, ALAC, MP3, FLAC); any other codec (DTS, TrueHD, PCM, ...) is re-encoded to AAC 192k for that track only, with a warning in the worker log. (Before 2026-10-03 only the first audio track was kept, and the GPU-encoder path always re-encoded it to AAC.)
