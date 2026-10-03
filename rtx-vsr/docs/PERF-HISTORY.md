@@ -320,3 +320,78 @@ synthetic clip, muxes it exactly like production, decodes it back and reports th
 Laplacian and a stale-frame count, one encoder session per container. Variants I (freed
 temporary, production's old lifetime) and N (same plus the sync) are the before/after:
 22 corrupt frames of 30 versus 0. `scripts/probe_gpu_encoder.py` cannot see any of this —
+
+## Encoder-bound, the hidden bitrate cap, and new defaults — measured 2026-10-03
+
+Source: a BBC Blu-ray remux (H.264 MBAFF, `field_order=tt`, untagged colour, fine grain),
+1080p→4K, `HIGHBITRATE_ULTRA`, RTX PRO 6000 Blackwell Server Edition, driver 580.95.05.
+Probes: `scripts/probe_stages.py`, `scripts/probe_encoder_quality.py`,
+`scripts/probe_nvdec_interlace.py`. Second opinions from Codex (gpt-6-astra) on the ffmpeg
+and PyNvVideoCodec sources.
+
+### The pipeline is encoder-bound
+
+| Stage, alone (300 frames) | Result |
+|---|---|
+| VSR `run()` | 3.5 ms/frame |
+| VSR + integrity + P010 | 4.4 ms/frame |
+| NVENC P4+qres+UHQ / P4+fullres | 65.0 / 61.3 fps |
+| NVENC P5+fullres+HQ / +UHQ | 68.1 / 38.5 fps |
+| NVENC P6+qres / P6+fullres / P6 single pass | 29.6 / 27.5 / 30.1 fps |
+| Full pipeline, serial vs VSR overlapped on a side stream (P4 / P6) | 61.0 vs 64.5 / 26.7 vs 26.9 fps |
+| Concurrent sessions, P6+fullres: 2 / 3 / 4 | 47.7 / 58.9 / 65.9 fps combined |
+| Concurrent sessions: 4x P4+qres / 2x and 4x P5+HQ | 166.8 / 125.7 and 209.8 fps combined |
+
+Encoder video clock 1912-1935 MHz under load, no throttle reasons, ~100 W of 600 W. The
+reference-list kwargs (`numrefl0/1=5` vs driver default) and UHQ vs HQ at P6 changed
+nothing. The 2026-08-18 "inference-bound at infer 74%" reading included time blocked on the
+encoder. StaxRip/NVEncC on an RTX 4070 ran the user's job at 71.7 fps with **P5 + HQ**
+(VEClock 2093 MHz); the same settings measured 68.1 fps per session here.
+
+### The bitrate cap and the "2.4x file" bug
+
+With `cq` set, PyNvVideoCodec zeroes `maxBitRate`; the driver substitutes a VBR ceiling
+from the level. With `level` unset the driver picked Level 5.0 or 6.0 per session for the
+same input. Every "normal" output was L5.0 (~17.5 Mbps), every 2.4x outlier L6.0
+(~40 Mbps); at an explicit L5.1 the HRD ceiling read 32 Mbps and CQ 18 and CQ 24 gave the
+same size (~27.5 Mbps). `Reconfigure()` with `maxBitRate` 100 Mbps before the first frame
+fixed it: CQ 18 → ~80 Mbps, CQ 24 → ~35 Mbps, and repeated runs became byte-identical.
+
+The first version used a 160 Mbit VBV buffer. In a warm container, an encoder created at a
+different resolution than the previous job then failed `nvEncInitializeEncoder` with
+error 8 (4K→8K, 8K→4K; reproducible; the original code passed 4K→8K). Bisected on three
+parallel deploys: dropping the explicit level, the ceiling, or P5+fullres each made it
+pass. A 1 s buffer (100 Mbit) passed 4K→8K→4K→1620p→4K and 8K→1620p→8K→4K, and the 4K
+outputs stayed byte-identical. Above 4K the level is left to the driver.
+
+### Quality matrix (ceiling lifted; VMAF 4K v0.6.1 vs a lossless encode of the same VSR frames)
+
+The fps column is the probe's in-container decode→VSR→encode loop with up to ten probe
+containers running at once, so it reads lower than the encode-only table above.
+
+| Setting | fps (1 session) | CQ 18: Mbps / VMAF / PSNR-Y | CQ 24: Mbps / VMAF / PSNR-Y |
+|---|---|---|---|
+| P4+qres+UHQ | 51-56 | 80.3 / 93.45 / 42.69 | 33.9 / 90.20 / 41.02 |
+| P5+fullres+HQ | 58-64 | 85.6 / 92.23 / 42.46 | 42.6 / 89.62 / 41.17 |
+| **P5+fullres+UHQ** | **36** | 81.9 / 94.28 / 43.33 | 34.7 / 91.28 / 41.52 |
+| P6+fullres+UHQ | 25 | 82.2 / 94.39 / 43.39 | 34.7 / 91.34 / 41.54 |
+| P7+fullres+UHQ | 24 | 82.1 / 94.50 / 43.45 | 34.7 / 91.43 / 41.56 |
+
+Defaults adopted: P5 + fullres + UHQ, CQ 20, Level 5.1 High, 100 Mbps ceiling. End to end
+on the 61 s sample: 35.7 fps warm, 78 Mbps, 1526/1526 frames, byte-identical across runs.
+
+### Decode-side fixes on this source
+
+- In-process NVDEC deinterlaced the PsF frames (Adaptive mode, chosen by `NvDecoder.cpp`
+  for any interlaced sequence): odd rows 7.8% of pixels off by >6 levels, vertical
+  gradient energy 0.684x of a woven decode. Interlace-flagged inputs now use ffmpeg's NVDEC
+  (weave). Downscaled back to 1080p, the woven path kept 69% more fine detail
+  (Laplacian 4.33 vs 2.56) and restored the source's vertical/horizontal balance.
+- swscale's default yuv→rgb24 tables read ~1.6 luma levels dark; `accurate_rnd+
+  full_chroma_int` measured +0.004. With it, `BICUBIC` mode round-trips at +0.007 and
+  `HIGHBITRATE_ULTRA` at -0.35 (the model's own offset).
+- rawvideo output needed `-fps_mode passthrough` (306 vs 304 frames).
+- The woven path cost about 12% throughput against in-process decode at the old P4
+  settings (52 vs 59 fps). At the new defaults the encoder (~36 fps) is far below either
+  decode path; the in-process path was not re-measured at those settings.
+

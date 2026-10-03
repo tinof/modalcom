@@ -3,10 +3,13 @@ name = "rtx_modal_upscaler"
 description = "NVIDIA RTX media upscaler service for Modal.com using RTX Video Super Resolution."
 version = "0.2.0"
 license = "LICENSE"
+# Explicit so uv.lock always carries wheels for the local 3.13 venv; a Dependabot
+# relock without it dropped every cp313 wheel from the lock.
+requires-python = ">=3.13"
 # Container runtime deps are pinned in the modal_app.py image definitions.
 dependencies = [
-  "modal>=1.5.4",
-  "requests>=2.33.0"
+  "modal>=1.6.0",
+  "requests>=2.34.2"
 ]
 
 [project.urls]

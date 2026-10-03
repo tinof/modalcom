@@ -3,6 +3,7 @@ import os
 import queue
 import shutil
 import subprocess
+import tempfile
 import threading
 import time
 import uuid
@@ -27,17 +28,36 @@ WORKER_CPU = float(os.getenv("MODAL_WORKER_CPU", "6"))
 # Benchmarks only: pinning the pool to one container is the only way to measure input
 # concurrency, since the autoscaler otherwise scales out rather than packing a container.
 WORKER_MAX_CONTAINERS = int(os.getenv("MODAL_WORKER_MAX_CONTAINERS", "0")) or None
-# The NVENC preset is the single biggest encoder lever (standalone 4K: p6 21 fps,
-# p5 31, p4 38.5) and encode is the pipeline's binding stage. Overridable so the
-# quality/throughput trade can be re-measured without editing this file.
-NVENC_PRESET = os.getenv("MODAL_NVENC_PRESET", "p4")
+# Encoder quality point, chosen by measurement (2026-10-03, see docs/PERF-HISTORY.md):
+# 1080p->4K BBC Blu-ray, same VSR frames, scored with VMAF 4K against a lossless encode.
+# The encoder is the pipeline's binding stage (VSR alone is 3.5 ms/frame). One NVENC
+# session, 4K encode only: P4+qres+UHQ 65 fps, P5+fullres+UHQ 38.5, P6 27.5, P7 ~24;
+# end to end at these defaults ~36 fps.
+#   * UHQ beats HQ: +1.7 VMAF at 19% fewer bits (P5, CQ 24). UHQ also turns on NVENC's
+#     temporal filter and deeper lookahead, which PyNvVideoCodec cannot set separately.
+#   * P5+fullres beats P4+qres by ~1.1 VMAF at equal bitrate.
+#   * P6/P7 add 0.06-0.15 VMAF over P5 for ~30% more encode time: not worth it.
+# Both encode paths read these, so the piped fallback stays directly comparable.
+NVENC_PRESET = os.getenv("MODAL_NVENC_PRESET", "p5")
 # fullres = two-pass at full resolution, qres = two-pass at quarter resolution (cheaper).
-NVENC_MULTIPASS = os.getenv("MODAL_NVENC_MULTIPASS", "qres")
-# The rest of the quality point, matching the reference NVEncC invocation
-# `--qvbr 18 --tune uhq --profile main10 --tier high --multipass 2pass-quarter
-#  --aq --aq-strength 10 --bframes 5 --ref 5` at preset P4. Both encode paths read these,
-# so the piped fallback and the GPU-resident path stay directly comparable.
-NVENC_CQ = os.getenv("MODAL_NVENC_CQ", "18")
+NVENC_MULTIPASS = os.getenv("MODAL_NVENC_MULTIPASS", "fullres")
+# uhq or hq. ffmpeg spells them -tune uhq/hq; PyNvVideoCodec wants uhq/high_quality.
+NVENC_TUNING = os.getenv("MODAL_NVENC_TUNING", "uhq")
+# CQ is a file-size choice once the bitrate ceiling below is lifted: on the reference
+# Blu-ray CQ 18 ~= 80 Mbps (VMAF 94.3) and CQ 24 ~= 35 Mbps (VMAF 91.3). 20 sits between.
+NVENC_CQ = os.getenv("MODAL_NVENC_CQ", "20")
+# Without an explicit level the driver picks one per session -- 5.0 or 6.0 for the same
+# input -- and each brings a different default VBV ceiling (~20 vs ~48 Mbps). That was
+# the "same job, 2.4x bigger file" bug. 5.1 High tier allows 160 Mbps and is the level
+# 4K TVs and players decode. It only fits outputs up to 8,912,896 luma samples (4096x2176);
+# _hevc_level() leaves larger outputs to the driver. "" leaves every output to the driver.
+NVENC_LEVEL = os.getenv("MODAL_NVENC_LEVEL", "5.1")
+# The VBV ceiling CQ is allowed to reach, in Mbit/s (buffer = 1 s at that rate, which
+# also fits Level 5.0 High's CPB limit). PyNvVideoCodec
+# zeroes maxBitRate whenever `cq` is set and the driver then substitutes its own ~32 Mbps
+# ceiling at 5.1 -- which held every encode below what CQ asked for (CQ 18 and CQ 24 came
+# out the same size). It is restored with Reconfigure() before the first frame.
+NVENC_MAX_MBPS = int(os.getenv("MODAL_NVENC_MAX_MBPS", "100"))
 NVENC_AQ_STRENGTH = os.getenv("MODAL_NVENC_AQ_STRENGTH", "10")
 NVENC_BFRAMES = os.getenv("MODAL_NVENC_BFRAMES", "5")
 NVENC_REFS = os.getenv("MODAL_NVENC_REFS", "5")
@@ -89,10 +109,15 @@ DRIVER_RUN_URL = (
     f"/NVIDIA-Linux-x86_64-{DRIVER_VERSION}.run"
 )
 
+# Pinned to a month-end autobuild: BtbN prunes the daily tags but keeps every month-end
+# release (back to 2024-11 as of 2026-10), whereas the `latest` tag is rebuilt daily and
+# would silently swap the NVENC SDK under the next image build. The checksum makes any
+# change to the artifact fail the build instead of degrading to libx264 at runtime.
 FFMPEG_URL = (
-    "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest"
-    "/ffmpeg-n8.1-latest-linux64-gpl-8.1.tar.xz"
+    "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-09-30-13-08"
+    "/ffmpeg-n8.1.3-9-g29e619e767-linux64-gpl-8.1.tar.xz"
 )
+FFMPEG_SHA256 = "97ce978979194b5cf7e06a5e68020dbdaa7a4f3294c5452b6a1bc347100dbb79"
 
 # The web tier only moves bytes, so it stays off the GPU image entirely.
 web_image = modal.Image.debian_slim(python_version="3.12").uv_pip_install(
@@ -118,6 +143,7 @@ gpu_image = (
         # (580.95.05) every NVENC encoder then fails to initialise and the worker
         # silently falls back to CPU libx264. n8.1 targets an SDK the driver supports.
         f"curl -fsSL -o /tmp/ff.tar.xz {FFMPEG_URL}",
+        f"echo '{FFMPEG_SHA256}  /tmp/ff.tar.xz' | sha256sum -c -",
         "mkdir -p /opt/ffmpeg",
         "tar -xJf /tmp/ff.tar.xz -C /opt/ffmpeg --strip-components=1",
         "cp /opt/ffmpeg/bin/ffmpeg /opt/ffmpeg/bin/ffprobe /usr/local/bin/",
@@ -139,6 +165,9 @@ gpu_image = (
         "MODAL_NVENC_PRESET": NVENC_PRESET,
         "MODAL_NVENC_MULTIPASS": NVENC_MULTIPASS,
         "MODAL_NVENC_CQ": NVENC_CQ,
+        "MODAL_NVENC_TUNING": NVENC_TUNING,
+        "MODAL_NVENC_LEVEL": NVENC_LEVEL,
+        "MODAL_NVENC_MAX_MBPS": str(NVENC_MAX_MBPS),
         "MODAL_NVENC_AQ_STRENGTH": NVENC_AQ_STRENGTH,
         "MODAL_NVENC_BFRAMES": NVENC_BFRAMES,
         "MODAL_NVENC_REFS": NVENC_REFS,
@@ -355,11 +384,28 @@ def _encoder_works(encoder: str, extra_args: tuple[str, ...] = ()) -> bool:
 NVENC_QUALITY_ARGS = [
     "-preset", NVENC_PRESET,
     "-rc", "vbr", "-cq", NVENC_CQ, "-b:v", "0",
+    # Same ceiling as the GPU path; without -maxrate ffmpeg leaves maxBitRate at 0 too.
+    *(["-maxrate", f"{NVENC_MAX_MBPS}M", "-bufsize", f"{NVENC_MAX_MBPS}M"]
+      if NVENC_MAX_MBPS > 0 else []),
     "-multipass", NVENC_MULTIPASS,
     "-spatial-aq", "1", "-temporal-aq", "1", "-aq-strength", NVENC_AQ_STRENGTH,
     "-rc-lookahead", "32",
     "-bf", NVENC_BFRAMES, "-b_ref_mode", "middle",
 ]
+
+
+def _hevc_level(width: int, height: int) -> str | None:
+    """NVENC_LEVEL for outputs that fit level 5.x (up to 4096x2176), else None.
+
+    Above 4K the driver picks the level (it chose 6.0 or 6.2 at 8K; with the ceiling
+    restored that no longer changes the file size). With the VBV buffer at 1.6x the
+    ceiling, a session at a different resolution than the previous job in the same warm
+    container failed nvEncInitializeEncoder with error 8 (4K->8K and 8K->4K); a 1 s buffer
+    fixed it for 4K, 1620p and 8K in both orders (2026-10-03).
+    """
+    if NVENC_LEVEL and width * height <= 8_912_896:  # level 5.x MaxLumaPs
+        return NVENC_LEVEL
+    return None
 
 
 def _ffmpeg_encode_command(
@@ -379,9 +425,11 @@ def _ffmpeg_encode_command(
     if encoder == "hevc_nvenc":
         # 10-bit Main 10 even from 8-bit sources: the extra encode precision costs nothing
         # on NVENC and keeps VSR's smooth gradients from banding.
+        level = _hevc_level(output_width, output_height)
         codec_args = [
             "-c:v", encoder, *NVENC_QUALITY_ARGS, *tune_args, *refs_args, *sfe_args,
             "-profile:v", "main10", "-tier", "high", "-pix_fmt", "p010le",
+            *(["-level", level] if level else []),
         ]
     elif encoder.endswith("_nvenc"):
         codec_args = ["-c:v", encoder, *NVENC_QUALITY_ARGS, *tune_args, *refs_args,
@@ -397,7 +445,7 @@ def _ffmpeg_encode_command(
         "-s", f"{output_width}x{output_height}", "-r", fps_str,
         "-i", "pipe:0",
         "-i", audio_source_path,
-        "-map", "0:v:0", "-map", "1:a:0?",
+        "-map", "0:v:0",
         # Raw RGB carries no color metadata, so swscale would convert with its bt601
         # default while players read HD output as bt709 — a visible hue shift. Convert
         # with bt709 explicitly, then setparams tags primaries and transfer as well:
@@ -407,10 +455,83 @@ def _ffmpeg_encode_command(
                "setparams=colorspace=bt709:color_primaries=bt709:color_trc=bt709:range=tv",
         "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709",
         *codec_args,
-        "-c:a", "copy", "-shortest",
+        *_audio_args(audio_source_path),
+        "-shortest",
         "-movflags", "+faststart",
         output_path,
     ]
+
+
+def _put_until_stopped(target: queue.Queue, item, stop: threading.Event) -> bool:
+    """Put into a bounded queue, giving up once `stop` is set.
+
+    A plain put() blocks forever when the consumer has died mid-job: the reader thread
+    then stays alive in the warm container, pinning the NVDEC session and its queued
+    CUDA frames until the container scales down.
+    """
+    while not stop.is_set():
+        try:
+            target.put(item, timeout=0.5)
+            return True
+        except queue.Full:
+            continue
+    return False
+
+
+def _stop_reader(reader, frame_queue: queue.Queue, stop: threading.Event) -> None:
+    """Release a reader thread after the consumer stops, whether it finished or raised."""
+    stop.set()
+    with contextlib.suppress(queue.Empty):
+        while True:
+            frame_queue.get_nowait()
+    if reader is not None:
+        reader.join(timeout=10)
+        if reader.is_alive():
+            print("WARNING: video reader thread did not exit within 10s of the job ending.")
+
+
+# Audio codecs the mp4 muxer accepts as-is. Anything else (DTS, TrueHD, PCM, Vorbis, ...)
+# is re-encoded to AAC, per track, with a warning.
+MP4_AUDIO_COPY_CODECS = frozenset({"aac", "ac3", "eac3", "opus", "alac", "mp3", "flac"})
+
+
+def _audio_args(source_path: str, input_index: int = 1) -> list[str]:
+    """Map every audio track of input `input_index` into the output, copying when possible.
+
+    Output contract (changed 2026-10-03): all audio tracks are kept, and each one is
+    stream-copied unless mp4 cannot carry its codec, in which case only that track is
+    re-encoded to AAC 192k. Before, only the first track was kept.
+    """
+    result = subprocess.run(
+        [
+            "ffprobe", "-v", "error", "-select_streams", "a",
+            "-show_entries", "stream=codec_name", "-of", "csv=p=0", source_path,
+        ],
+        capture_output=True, text=True, check=False,
+    )
+    if result.returncode != 0:
+        print(
+            "WARNING: could not probe audio codecs "
+            f"({result.stderr.strip()[:300]}); re-encoding all audio tracks to AAC."
+        )
+        return ["-map", f"{input_index}:a?", "-c:a", "aac", "-b:a", "192k"]
+    codecs = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    if not codecs:
+        return []
+    args = ["-map", f"{input_index}:a"]
+    reencoded = []
+    for index, codec in enumerate(codecs):
+        if codec in MP4_AUDIO_COPY_CODECS:
+            args += [f"-c:a:{index}", "copy"]
+        else:
+            args += [f"-c:a:{index}", "aac", f"-b:a:{index}", "192k"]
+            reencoded.append(f"#{index} {codec}")
+    if reencoded:
+        print(
+            "WARNING: mp4 cannot carry these audio tracks as-is, re-encoding them to AAC "
+            f"192k: {', '.join(reencoded)}."
+        )
+    return args
 
 
 def _probe_video_metadata(input_path: str) -> tuple[int, int, float]:
@@ -483,11 +604,56 @@ def _rgb_to_p010(rgb):
     return (packed * 64).to(torch.uint16)
 
 
+# ffprobe colour_space values -> swscale in_color_matrix names.
+_SWS_MATRIX = {
+    "bt709": "bt709", "smpte170m": "smpte170m", "bt470bg": "bt470",
+    "smpte240m": "smpte240m", "fcc": "fcc", "bt2020nc": "bt2020", "bt2020c": "bt2020",
+}
+INTERLACED_FIELD_ORDERS = frozenset({"tt", "bb", "tb", "bt"})
+
+
+def _probe_decode_hints(input_path: str) -> dict[str, str]:
+    """field_order, color_space, color_range and height of the first video stream."""
+    result = subprocess.run(
+        [
+            "ffprobe", "-v", "error", "-select_streams", "v:0",
+            "-show_entries", "stream=field_order,color_space,color_range,height",
+            "-of", "default=noprint_wrappers=1", input_path,
+        ],
+        capture_output=True, text=True, check=False,
+    )
+    hints = {}
+    for line in result.stdout.splitlines():
+        key, _, value = line.partition("=")
+        hints[key.strip()] = value.strip()
+    return hints
+
+
 def _ffmpeg_decode_command(input_path: str, use_nvdec: bool) -> list[str]:
     hwaccel = ["-hwaccel", "cuda"] if use_nvdec else []
+    # Untagged streams are the norm on Blu-ray and broadcast HD, and swscale treats an
+    # unspecified matrix as BT.601 -- a visible hue shift on HD, since the encode side
+    # tags the output bt709. Pick the matrix the way NVDEC's own RGB path does: the
+    # stream's tag if present, else BT.709 above 576 lines and BT.601 at or below.
+    hints = _probe_decode_hints(input_path)
+    matrix = _SWS_MATRIX.get(hints.get("color_space", ""))
+    if matrix is None:
+        height = int(hints["height"]) if hints.get("height", "").isdigit() else 1080
+        matrix = "bt709" if height > 576 else "smpte170m"
+    in_range = "pc" if hints.get("color_range") == "pc" else "tv"
     return [
         "ffmpeg", "-hide_banner", "-loglevel", "error", *hwaccel,
         "-i", input_path, "-an", "-sn", "-dn",
+        # rawvideo output defaults to CFR, which duplicates frames to fill timestamp gaps
+        # (measured 306 frames from a 304-frame Blu-ray cut). Pass frames through 1:1.
+        "-fps_mode", "passthrough",
+        # Both flags are load-bearing. Without full_chroma_int swscale converts through
+        # integer lookup tables that sit ~1.6 Y levels low (measured -1.64 on real content
+        # and on a neutral grey ramp; exact with the flags: +0.004). accurate_rnd alone
+        # does not leave the table path, and NVDEC hands over nv12, where
+        # full_chroma_int alone is enough but yuv420p (CPU decode) needs both.
+        "-vf", f"scale=in_color_matrix={matrix}:in_range={in_range}"
+               ":flags=bicubic+accurate_rnd+full_chroma_int",
         "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1",
     ]
 
@@ -566,8 +732,8 @@ class UpscaleWorker:
         # UHQ tuning is an SDK 12.2+ HEVC feature, but whether this ffmpeg build exposes
         # the tune name varies, so probe instead of assuming.
         self.encoder_tune = None
-        if self.encoder == "hevc_nvenc" and _encoder_works(self.encoder, ("-tune", "uhq")):
-            self.encoder_tune = "uhq"
+        if self.encoder == "hevc_nvenc" and _encoder_works(self.encoder, ("-tune", NVENC_TUNING)):
+            self.encoder_tune = NVENC_TUNING
         # Multi-reference frames (NVEncC's --ref) likewise depend on the build and the
         # card's NVENC generation, so probe rather than assume.
         self.encoder_refs = self.encoder.endswith("_nvenc") and _encoder_works(
@@ -576,6 +742,7 @@ class UpscaleWorker:
         print(
             f"Selected video encoder: {self.encoder} (tune={self.encoder_tune or 'none'}, "
             f"preset={NVENC_PRESET}, cq={NVENC_CQ}, multipass={NVENC_MULTIPASS}, "
+            f"level={NVENC_LEVEL}, maxrate={NVENC_MAX_MBPS}M, "
             f"refs={NVENC_REFS if self.encoder_refs else 'default'})"
         )
         # Cached effect instances keyed by (thread, role) -> (quality, out_w, out_h). Two
@@ -767,6 +934,7 @@ class UpscaleWorker:
         quality: str,
         keep_aspect_ratio: bool = True,
         preprocess: str | None = None,
+        scratch_dir: Path | None = None,
     ) -> tuple[str, str]:
         """GPU-resident output path: VSR result goes to NVENC without touching the host.
 
@@ -790,8 +958,11 @@ class UpscaleWorker:
 
         output_name = f"{stem}_upscaled.mp4"
         output_path = output_dir / output_name
-        video_only_path = output_dir / f"{stem}_video.mp4"
-        decode_log_path = output_dir / "ffmpeg-decode.log"
+        # Intermediates stay on container-local disk; only the final output goes to the
+        # Volume, so a failed job never commits a multi-GB partial stream.
+        scratch_dir = scratch_dir or output_dir
+        video_only_path = scratch_dir / f"{stem}_video.mp4"
+        decode_log_path = scratch_dir / "ffmpeg-decode.log"
 
         in_width, in_height, fps = _probe_video_metadata(input_path.as_posix())
         plan = plan_dimensions(
@@ -810,9 +981,11 @@ class UpscaleWorker:
         # deferred until we know we actually need the piped decoder.
         use_nvdec = _nvdec_can_decode(input_path.as_posix())
 
-        # Mirrors NVEncC's `--qvbr <cq> --tune uhq --tier high --multipass 2pass-quarter
-        # --aq --aq-strength N --bframes 5 --ref 5` at preset P4. Main 10 needs no kwarg:
-        # the profile autoselects from the P010 input surface.
+        # Equivalent to NVEncC `--qvbr <cq> --preset p5 --tune uhq --tier high --level 5.1
+        # --max-bitrate 100000 --multipass 2pass-full --aq --aq-strength N --aq-temporal
+        # --bframes 5 --lookahead 32`. Main 10 needs no kwarg: the profile autoselects
+        # from the P010 input surface. Reference lists are left to the driver (NVEncC's
+        # `MultiRef L0:auto L1:auto`); numrefl0/1 forced 5+5 and measured no faster.
         #
         # Two spellings here are load-bearing and were wrong before. PyNvVideoCodec's
         # option parser drops unknown keys silently (they land in a map<string,string>
@@ -820,16 +993,31 @@ class UpscaleWorker:
         #   * `qp` is not a key at all. The old `qp="19"` did nothing and this path ran
         #     plain VBR at the default ~10 Mbps target -- the 2x bitrate gap against the
         #     piped path. The quality-target key is `cq` (NVENC targetQuality).
-        #   * the tuning value is `uhq`, not `ultra_high_quality`; the latter falls
-        #     through to UNDEFINED, which is the error 8 seen when this was first tried.
+        #   * the tuning value is `uhq`, not `ultra_high_quality`, and HQ is
+        #     `high_quality`, not `hq`; anything else falls through to UNDEFINED, which
+        #     surfaces as error 8 at CreateEncoder.
+        #   * `temporalaq` enables on any non-empty string (even "0"); "" left it unset.
         # `aq` is a single key that both enables AQ and sets its strength.
         encoder = nvc.CreateEncoder(
             plan.output_width, plan.output_height, "P010", False,
-            codec="hevc", preset=NVENC_PRESET.upper(), tuning_info="uhq",
+            codec="hevc", preset=NVENC_PRESET.upper(),
+            tuning_info={"hq": "high_quality"}.get(NVENC_TUNING, NVENC_TUNING),
             rc="vbr", cq=NVENC_CQ, multipass=NVENC_MULTIPASS, tier="high",
-            aq=NVENC_AQ_STRENGTH, temporalaq="", lookahead="32",
-            bf=NVENC_BFRAMES, numrefl0=NVENC_REFS, numrefl1=NVENC_REFS, gop="250",
+            aq=NVENC_AQ_STRENGTH, temporalaq="1", lookahead="32",
+            bf=NVENC_BFRAMES, gop="250",
+            **({"level": level} if (level := _hevc_level(plan.output_width,
+                                                          plan.output_height)) else {}),
         )
+        # `cq` makes PyNvVideoCodec zero maxBitRate, and the driver then caps VBR at its
+        # own default (~32 Mbps at 5.1), so CQ never reached its target. Restore the
+        # ceiling before the first frame -- and before GetSequenceParams() below, since
+        # the HRD values land in the VPS/SPS the muxer stores as extradata.
+        if NVENC_MAX_MBPS > 0:
+            rc = encoder.GetEncodeReconfigureParams()
+            rc.maxBitRate = NVENC_MAX_MBPS * 1_000_000
+            rc.vbvBufferSize = NVENC_MAX_MBPS * 1_000_000
+            if not encoder.Reconfigure(rc):
+                raise RuntimeError("NVENC Reconfigure() refused the bitrate ceiling.")
         fps_num, fps_den = Fraction(fps).limit_denominator(65535).as_integer_ratio()
         muxer = nvc.FFmpegMuxer(
             video_only_path.as_posix(), nvc.MP4, "hevc",
@@ -849,8 +1037,25 @@ class UpscaleWorker:
         # Deliberately the low-level demuxer/decoder pair. ThreadedDecoder is unusable in
         # PyNvVideoCodec 2.2.0: it drains after exactly one frame in every configuration
         # probed (NATIVE/RGB/RGBP, every buffer and batch size, mkv and mp4).
+        # Interlace-flagged streams (field_order tt/bb, i.e. most UK/EU HD Blu-ray and
+        # broadcast) make PyNvVideoCodec create its decoder in Adaptive deinterlace mode,
+        # and 2.2.0 exposes no kwarg to change it. On PsF content -- progressive frames in
+        # an interlaced container, the usual case for drama -- that rewrites one field's
+        # rows: probed on a BBC Blu-ray, 7.8% of odd-row pixels changed by >6 levels (up to
+        # 31% in a frame) and 32% of vertical detail was gone before VSR saw the frame.
+        # ffmpeg's NVDEC path weaves instead (lossless for PsF), so route those inputs to
+        # the piped decoder. Truly interlaced (50i/60i) video would want a real
+        # deinterlacer such as bwdif ahead of VSR; that is not handled here.
+        field_order = _probe_decode_hints(input_path.as_posix()).get("field_order", "")
+        interlaced = field_order in INTERLACED_FIELD_ORDERS
+        if interlaced and GPU_DECODER and use_nvdec:
+            print(
+                f"WARNING: input is flagged interlaced (field_order={field_order}); "
+                "in-process NVDEC would apply Adaptive deinterlacing and soften vertical "
+                "detail, so decoding through ffmpeg NVDEC (woven) instead."
+            )
         gpu_decoder = None
-        if GPU_DECODER and use_nvdec:
+        if GPU_DECODER and use_nvdec and not interlaced:
             try:
                 demuxer = nvc.CreateDemuxer(filename=input_path.as_posix())
                 gpu_decoder = nvc.CreateDecoder(
@@ -868,6 +1073,7 @@ class UpscaleWorker:
         decoder_proc = None
         reader = None
         frame_queue: queue.Queue = queue.Queue(maxsize=max(8, 3 * batch_limit))
+        stop_reading = threading.Event()
 
         if gpu_decoder is not None:
             # Decode on its own thread. This is for honest accounting and headroom, not
@@ -881,11 +1087,13 @@ class UpscaleWorker:
                 try:
                     for packet in demuxer:
                         for decoded in gpu_decoder.Decode(packet):
-                            frame_queue.put(torch.from_dlpack(decoded).clone())
+                            frame = torch.from_dlpack(decoded).clone()
+                            if not _put_until_stopped(frame_queue, frame, stop_reading):
+                                return
                 except Exception as exc:  # surfaced on the main thread below
-                    frame_queue.put(exc)
+                    _put_until_stopped(frame_queue, exc, stop_reading)
                 finally:
-                    frame_queue.put(None)
+                    _put_until_stopped(frame_queue, None, stop_reading)
 
             reader = threading.Thread(target=_read_cuda_frames, daemon=True)
             reader.start()
@@ -908,11 +1116,12 @@ class UpscaleWorker:
                         buffer = decoder_proc.stdout.read(frame_bytes)
                         if not buffer or len(buffer) < frame_bytes:
                             break
-                        frame_queue.put(buffer)
+                        if not _put_until_stopped(frame_queue, buffer, stop_reading):
+                            return
                 except Exception as exc:  # surfaced on the main thread below
-                    frame_queue.put(exc)
+                    _put_until_stopped(frame_queue, exc, stop_reading)
                 finally:
-                    frame_queue.put(None)
+                    _put_until_stopped(frame_queue, None, stop_reading)
 
             reader = threading.Thread(target=_read_frames, daemon=True)
             reader.start()
@@ -994,6 +1203,8 @@ class UpscaleWorker:
             if decoder_proc is not None:
                 with contextlib.suppress(Exception):
                     decoder_proc.stdout.close()
+            _stop_reader(reader, frame_queue, stop_reading)
+            if decoder_proc is not None:
                 decoder_proc.wait()
             if decode_log_handle is not None:
                 decode_log_handle.close()
@@ -1023,8 +1234,8 @@ class UpscaleWorker:
             "ffmpeg", "-y", "-loglevel", "error",
             "-i", video_only_path.as_posix(),
             "-i", input_path.as_posix(),
-            "-map", "0:v:0", "-map", "1:a:0?",
-            "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+            "-map", "0:v:0", *_audio_args(input_path.as_posix()),
+            "-c:v", "copy",
             "-bsf:v", "hevc_metadata=colour_primaries=1:transfer_characteristics=1"
                       ":matrix_coefficients=1:video_full_range_flag=0",
             "-movflags", "+faststart", output_path.as_posix(),
@@ -1058,19 +1269,21 @@ class UpscaleWorker:
         quality: str,
         keep_aspect_ratio: bool = True,
         preprocess: str | None = None,
+        scratch_dir: Path | None = None,
     ) -> tuple[str, str]:
         import numpy as np
 
         if GPU_ENCODER and self.encoder == "hevc_nvenc":
             return self._upscale_video_gpu(
                 input_path, output_dir, stem, resize_type, scale, width, height,
-                quality, keep_aspect_ratio, preprocess,
+                quality, keep_aspect_ratio, preprocess, scratch_dir,
             )
 
         output_name = f"{stem}_upscaled.mp4"
         output_path = output_dir / output_name
-        stderr_path = output_dir / "ffmpeg.log"
-        decode_log_path = output_dir / "ffmpeg-decode.log"
+        scratch_dir = scratch_dir or output_dir
+        stderr_path = scratch_dir / "ffmpeg.log"
+        decode_log_path = scratch_dir / "ffmpeg-decode.log"
 
         in_width, in_height, fps = _probe_video_metadata(input_path.as_posix())
         plan = plan_dimensions(
@@ -1119,6 +1332,7 @@ class UpscaleWorker:
         frame_queue: queue.Queue = queue.Queue(maxsize=max(8, 3 * batch_limit))
         write_queue: queue.Queue = queue.Queue(maxsize=max(8, 3 * batch_limit))
         writer_errors: list[Exception] = []
+        stop_reading = threading.Event()
 
         def _read_frames() -> None:
             try:
@@ -1126,11 +1340,12 @@ class UpscaleWorker:
                     buffer = decoder_proc.stdout.read(frame_bytes)
                     if not buffer or len(buffer) < frame_bytes:
                         break
-                    frame_queue.put(buffer)
+                    if not _put_until_stopped(frame_queue, buffer, stop_reading):
+                        return
             except Exception as exc:  # surfaced on the main thread below
-                frame_queue.put(exc)
+                _put_until_stopped(frame_queue, exc, stop_reading)
             finally:
-                frame_queue.put(None)
+                _put_until_stopped(frame_queue, None, stop_reading)
 
         def _write_frames() -> None:
             failed = False
@@ -1196,6 +1411,7 @@ class UpscaleWorker:
         finally:
             with contextlib.suppress(Exception):
                 decoder_proc.stdout.close()
+            _stop_reader(reader, frame_queue, stop_reading)
             decoder_proc.wait()
             write_queue.put(None)
             writer.join()
@@ -1266,21 +1482,26 @@ class UpscaleWorker:
             raise
 
         stem = Path(input_name).stem
-        upscale = self._upscale_video if _is_video(input_name, mime_type) else self._upscale_image
+        args = (
+            input_path, job_dir, stem, resize_type, scale, width, height, quality,
+            keep_aspect_ratio, preprocess,
+        )
+        # Video intermediates (the video-only stream, ffmpeg logs) live on local disk and
+        # never reach the Volume. This is also the first step towards the scratch-off-Volume
+        # prerequisite for MODAL_WORKER_CONCURRENCY > 1.
+        scratch_dir = Path(tempfile.mkdtemp(prefix=f"rtx-{job_id}-"))
         try:
-            output_name, media_type = upscale(
-                input_path,
-                job_dir,
-                stem,
-                resize_type,
-                scale,
-                width,
-                height,
-                quality,
-                keep_aspect_ratio,
-                preprocess,
-            )
+            if _is_video(input_name, mime_type):
+                output_name, media_type = self._upscale_video(*args, scratch_dir=scratch_dir)
+            else:
+                output_name, media_type = self._upscale_image(*args)
+        except BaseException:
+            # /result cannot clean up after a failure (it only learns the job id from a
+            # successful return), so drop the job's files here before the commit below.
+            shutil.rmtree(job_dir, ignore_errors=True)
+            raise
         finally:
+            shutil.rmtree(scratch_dir, ignore_errors=True)
             input_path.unlink(missing_ok=True)
             import gc
             import torch
@@ -1294,16 +1515,21 @@ class UpscaleWorker:
         return {"job_id": job_id, "output_name": output_name, "media_type": media_type}
 
 
+# The web tier talks to the Volume through its API, not a mount. With a mount, concurrent
+# inputs share one view of the Volume: a /result reload() fails while another input has an
+# upload open on it ("volume busy") and can drop other inputs' uncommitted writes. The
+# API calls are atomic per file, so there is nothing to reload, commit, or serialize.
 @app.function(
     image=web_image,
     timeout=900,
-    volumes={JOBS_DIR.as_posix(): jobs_volume},
 )
 @modal.asgi_app(requires_proxy_auth=True)
 @modal.concurrent(max_inputs=20)
 def api():
+    from urllib.parse import quote
+
     from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
-    from fastapi.responses import FileResponse, JSONResponse
+    from fastapi.responses import JSONResponse, StreamingResponse
 
     web_app = FastAPI(
         title="RTX Media Upscaler",
@@ -1354,23 +1580,18 @@ def api():
 
         input_name = file.filename or "upload.bin"
         job_id = uuid.uuid4().hex
-        job_dir = JOBS_DIR / job_id
-        job_dir.mkdir(parents=True, exist_ok=True)
-        input_path = job_dir / f"input{Path(input_name).suffix or '.bin'}"
+        remote_input = f"/{job_id}/input{Path(input_name).suffix or '.bin'}"
 
-        # Stream to the Volume so a multi-GB upload never lands in memory.
-        bytes_written = 0
-        with input_path.open("wb") as dest:
-            while chunk := await file.read(8 * 1024 * 1024):
-                dest.write(chunk)
-                bytes_written += len(chunk)
-
-        if bytes_written == 0:
-            shutil.rmtree(job_dir, ignore_errors=True)
-            await jobs_volume.commit.aio()
+        # Starlette has already spooled the multipart body to a local temp file, so this
+        # uploads from disk and a multi-GB file never lands in memory. The batch commits
+        # on exit; the worker's reload() then sees it.
+        upload = file.file
+        upload.seek(0, os.SEEK_END)
+        if upload.tell() == 0:
             raise HTTPException(status_code=400, detail="Uploaded file is empty.")
-
-        await jobs_volume.commit.aio()
+        upload.seek(0)
+        async with jobs_volume.batch_upload.aio() as batch:
+            batch.put_file(upload, remote_input)
 
         call = await UpscaleWorker().run.spawn.aio(
             job_id=job_id,
@@ -1408,23 +1629,42 @@ def api():
                 raise HTTPException(status_code=400, detail=msg) from exc
             raise HTTPException(status_code=500, detail=f"Upscaling failed: {exc}") from exc
 
-        await jobs_volume.reload.aio()
-        job_dir = JOBS_DIR / job["job_id"]
-        output_path = job_dir / job["output_name"]
-        if not output_path.exists():
+        output_path = f"/{job['job_id']}/{job['output_name']}"
+        try:
+            entries = await jobs_volume.listdir.aio(output_path)
+        except (FileNotFoundError, modal.exception.NotFoundError):
+            entries = []
+        if not entries:
             raise HTTPException(status_code=410, detail="Output already downloaded or cleaned up.")
 
-        background_tasks.add_task(_cleanup_job_dir, job_dir)
-        return FileResponse(
-            path=output_path.as_posix(),
-            filename=job["output_name"],
+        # read_file prefetches up to cpu_count() 8 MiB blocks ahead of the client (17 on
+        # the probed web container, ~136 MiB per download). There is no hard memory limit
+        # on this function, so that is extra billed memory while a download streams, not
+        # an OOM risk.
+        async def _stream():
+            async for chunk in jobs_volume.read_file.aio(output_path):
+                yield chunk
+
+        background_tasks.add_task(_cleanup_job_dir, job["job_id"])
+        filename = job["output_name"]
+        ascii_name = filename.encode("ascii", "replace").decode().replace('"', "_")
+        return StreamingResponse(
+            _stream(),
             media_type=job["media_type"],
+            headers={
+                # Content-Length lets the client detect a truncated download.
+                "Content-Length": str(entries[0].size),
+                "Content-Disposition": (
+                    f'attachment; filename="{ascii_name}"; '
+                    f"filename*=utf-8''{quote(filename)}"
+                ),
+            },
         )
 
     return web_app
 
 
-async def _cleanup_job_dir(job_dir: Path) -> None:
-    shutil.rmtree(job_dir, ignore_errors=True)
-    await jobs_volume.commit.aio()
+async def _cleanup_job_dir(job_id: str) -> None:
+    with contextlib.suppress(FileNotFoundError):
+        await jobs_volume.remove_file.aio(f"/{job_id}", recursive=True)
 
