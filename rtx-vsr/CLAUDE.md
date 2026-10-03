@@ -247,6 +247,18 @@ Manager Blu-ray sample.
   ceiling or P5+fullres each hid it; the 1 s buffer fixed it for 4K, 1620p and 8K in both
   orders. Any change to the level, ceiling or buffer must re-run a mixed-size sequence in
   one container (e.g. 2x, 4x, 2x, 1.5x, 2x), not just one job.
+- **Explicit level + P5+fullres stays fragile after a size change; the code falls back.**
+  The first production deploy of these defaults failed *every* video job after an image
+  job, and later 1620p→4K failed intermittently, all with error 8 at `CreateEncoder`. What
+  the failures have in common: the previous job left a VSR effect (or encoder state) at a
+  different output size. Bisected: dropping the explicit level made every sequence pass;
+  P4+qres also passed. Two mitigations in `_upscale_video_gpu`: the job's VSR effect is
+  loaded *before* `CreateEncoder` (fixes image→video), and an error-8 rejection of the
+  explicit level retries once without it, with a WARNING (`rejected explicit HEVC level`).
+  In 16 mixed jobs the fallback fired 4 times; those 4K outputs carried level 5.0 or 6.0
+  instead of 5.1, with the same 100 Mbps ceiling and file size. **Test image→video and
+  size switches before deploying any encoder change** — the bench runs that preceded the
+  failed deploy were all video-first.
 - **Always set the HEVC level.** With `level` unset the driver chose 5.0 or 6.0 per
   session for identical input, each with a different default ceiling — the "same job, 2.4x
   bigger file" bug. `MODAL_NVENC_LEVEL` defaults to 5.1 and applies to outputs up to

@@ -86,7 +86,10 @@ whenever a CQ target is set, and the driver then applies its own VBR ceiling: ab
 hit that ceiling, so CQ 18 and CQ 24 produced the same file size. The driver also picked
 the level per session (5.0 or 6.0 for the same input), so the same job sometimes produced a
 2.4x larger file. The worker now sets Level 5.1 explicitly for outputs up to 4K and
-restores a 100 Mbps ceiling (1 s buffer) with `Reconfigure()` before the first frame. Expect output bitrate to follow the content:
+restores a 100 Mbps ceiling (1 s buffer) with `Reconfigure()` before the first frame. In
+some warm-container states (a job right after one with a different output size) NVENC
+rejects the explicit level; the worker then retries with the driver's level and logs a
+warning. The ceiling, and so the file size, is the same either way. Expect output bitrate to follow the content:
 grainy 4K at CQ 20 lands roughly between 35 and 80 Mbps.
 
 ### Interlace-flagged sources (UK/EU Blu-ray and broadcast)
