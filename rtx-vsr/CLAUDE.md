@@ -272,8 +272,10 @@ Manager Blu-ray sample.
   constant also pins the batch for a correctness reason (the cross-stream DLPack race), so
   do not raise it for speed or memory without reading the post-mortem.
 - **`ThreadedDecoder` is unusable in PyNvVideoCodec 2.2.0** — it drains after exactly one
-  frame in every configuration probed. Use the low-level `CreateDemuxer` + `CreateDecoder`
-  pair, which `_upscale_video_gpu` does.
+  frame in every configuration probed. 2.2.3 (pinned since 2026-10-04) did not touch it:
+  its source diff against 2.2.0 is the Windows ARM64 port plus the bundled libavformat
+  (FFmpeg 8.1.2 → 9.0.1), nothing in the encoder, decoder or muxer code. Use the
+  low-level `CreateDemuxer` + `CreateDecoder` pair, which `_upscale_video_gpu` does.
 - **`.clone()` the decoder output too.** The decoder recycles its surfaces on the next
   `Decode()`; an uncloned view's mean was measured changing under it.
 - **`outputColorType=OutputColorType.RGB`** gives tightly packed **HWC uint8** with no

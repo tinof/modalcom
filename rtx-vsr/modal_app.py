@@ -156,7 +156,7 @@ gpu_image = (
         "pillow==12.3.0",
         "torch==2.13.0",
         "nvidia-vfx==0.1.0.1",
-        "PyNvVideoCodec==2.2.0",
+        "PyNvVideoCodec==2.2.3",
     )
     # NVENC_PRESET is read again at container import, where the deploying shell's
     # environment does not exist. Bake it into the image or the container silently
@@ -1061,11 +1061,11 @@ class UpscaleWorker:
         # architecture, not throughput.
         #
         # Deliberately the low-level demuxer/decoder pair. ThreadedDecoder is unusable in
-        # PyNvVideoCodec 2.2.0: it drains after exactly one frame in every configuration
+        # PyNvVideoCodec 2.2.0 (unchanged in 2.2.3): it drains after exactly one frame in every configuration
         # probed (NATIVE/RGB/RGBP, every buffer and batch size, mkv and mp4).
         # Interlace-flagged streams (field_order tt/bb, i.e. most UK/EU HD Blu-ray and
         # broadcast) make PyNvVideoCodec create its decoder in Adaptive deinterlace mode,
-        # and 2.2.0 exposes no kwarg to change it. On PsF content -- progressive frames in
+        # and 2.2.x exposes no kwarg to change it (re-probed on 2.2.3). On PsF content -- progressive frames in
         # an interlaced container, the usual case for drama -- that rewrites one field's
         # rows: probed on a BBC Blu-ray, 7.8% of odd-row pixels changed by >6 levels (up to
         # 31% in a frame) and 32% of vertical detail was gone before VSR saw the frame.

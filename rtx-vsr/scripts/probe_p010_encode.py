@@ -25,7 +25,7 @@ import modal
 image = (
     modal.Image.debian_slim(python_version="3.12")
     .apt_install("ffmpeg")
-    .uv_pip_install("torch==2.13.0", "PyNvVideoCodec==2.2.0", "numpy==2.5.2")
+    .uv_pip_install("torch==2.13.0", "PyNvVideoCodec==2.2.3", "numpy==2.5.2")
 )
 
 app = modal.App("rtx-probe-p010-encode", image=image)
