@@ -554,9 +554,8 @@ put some artificial limits in place.
 
 ### Upgrading v1 Volumes
 
-Currently, there is no automated tool for upgrading v1 Volumes to v2. We are
-planning to implement an automated migration path but for now v1 Volumes need
-to be manually migrated by creating a new v2 Volume and either copying files
+Currently, there is no automated tool for upgrading v1 Volumes to v2. v1 Volumes
+need to be manually migrated by creating a new v2 Volume and either copying files
 over from the v1 Volume or writing new files.
 
 To reuse the name of an existing v1 Volume for a new v2 Volume, first stop all

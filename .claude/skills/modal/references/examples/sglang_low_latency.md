@@ -293,7 +293,7 @@ substantially cut when previous interaction turns are in the KV cache.
 KV caches are stored in [GPU RAM](https://modal.com/gpu-glossary/device-hardware/gpu-ram),
 so they aren't shared across replicas.
 To improve cache hit rate, Modal Servers
-include sticky routing based on a client-provided header.
+include affinity routing based on a client-provided header.
 See the client code below for details.
 
 For production-scale LLM inference services, there are generally
@@ -546,7 +546,7 @@ Modal returns the [503 Service Unavailable status](https://developer.mozilla.org
 when a Modal Server has no live replicas.
 
 We include a header with each request --
-`Modal-Session-ID`.
+`Modal-Routing-Affinity-Key`.
 This is header is used by clients of Modal Servers
 to identify which requests should be routed to the same container
 (with caveats explained below).
@@ -570,7 +570,7 @@ async def probe(url, messages=None, timeout=5 * MINUTES):
 
     client_id = str(0)  # set this to some string per multi-turn interaction
     # often a UUID per "conversation"
-    headers = {"Modal-Session-ID": client_id}
+    headers = {"Modal-Routing-Affinity-Key": client_id}
     deadline = time.time() + timeout
     async with aiohttp.ClientSession(base_url=url, headers=headers) as session:
         while time.time() < deadline:

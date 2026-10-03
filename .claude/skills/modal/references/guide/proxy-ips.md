@@ -30,6 +30,10 @@ can have a maximum of five static IP addresses.
 
 Please reach out to <support@modal.com> if you need greater limits.
 
+You can select which region the Proxy should live in when creating it.
+This allows you to control where in the world the traffic will be routed through.
+Placing it closer to the resources you want to connect with can reduce overall latency.
+
 ## Using a Proxy
 
 After a Proxy is online, add it to a Modal Function with the argument
@@ -64,6 +68,9 @@ latency to your Function's networking. If you are experiencing networking issues
 with Proxies related to performance, first add more IP addresses to your
 Proxy (see [Adding more IP addresses to a Proxy](#adding-more-ip-addresses-to-a-proxy)).
 
+Placing your Proxy geographically closer to a target may also improve overall performance.
+See [Creating a Proxy](#creating-a-proxy) for selecting the Proxy region when creating it.
+
 ## Adding more IP addresses to a Proxy
 
 Proxies support up to five static IP addresses. Adding IP addresses improves
@@ -76,7 +83,8 @@ If a Proxy has multiple IPs, Modal will randomly pick one when running your Func
 
 ## Proxies and Sandboxes
 
-Proxies can also be used with [Sandboxes](/docs/guide/sandboxes). For example:
+Proxies can also be used with [Sandboxes](/docs/guide/sandboxes) and their
+[Sidecars](/docs/guide/sandbox-sidecars). For example:
 
 ```python notest
 import modal
@@ -96,3 +104,8 @@ sb.terminate()
 
 Similarly to our Function implementation, this Sandbox program will
 always print the same IP address.
+
+A Proxy specified at Sandbox creation covers the main Sandbox, and is not inherited by its
+Sidecars. Specify the same Proxy at each Sidecar creation to also cover them.
+Likewise, [`CloudBucketMount`](/docs/guide/cloud-bucket-mounts) traffic does not
+exit through a Proxy for Functions or Sandboxes.

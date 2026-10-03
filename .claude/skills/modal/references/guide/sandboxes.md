@@ -18,6 +18,7 @@ This can be useful if, for example, you want to:
 * Create isolated environments for running untrusted code.
 * Check out a git repository and run a command against it, like a test suite, or
   `npm lint`.
+* Run tests or CI pipelines against a full Docker stack.
 * Run containers with arbitrary dependencies and setup scripts.
 
 Each individual job is called a **Sandbox** and can be created using the
@@ -39,7 +40,6 @@ for line in p.stdout:
     print(line, end="")
 
 sb.terminate()
-sb.detach()
 ```
 
 {/snippet}
@@ -59,7 +59,6 @@ async for line in p.stdout:
     print(line, end="")
 
 await sb.terminate.aio()
-await sb.detach.aio()
 ```
 
 {/snippet}
@@ -193,7 +192,6 @@ a `timeout` of up to 24 hours to the `Sandbox.create(...)` function.
 
 ```python fixture:sb_app
 sb = modal.Sandbox.create(app=sb_app, timeout=10*60)  # 10 minutes
-sb.detach()
 ```
 
 {/snippet}
@@ -202,7 +200,6 @@ sb.detach()
 
 ```python fixture:sb_app
 sb = await modal.Sandbox.create.aio(app=sb_app, timeout=10*60)  # 10 minutes
-await sb.detach.aio()
 ```
 
 {/snippet}
@@ -213,7 +210,6 @@ await sb.detach.aio()
 const sb = await modal.sandboxes.create(app, image, {
   timeoutMs: 10 * 60 * 1000, // 10 minutes
 });
-sb.detach();
 ```
 
 {/snippet}
@@ -224,7 +220,6 @@ sb.detach();
 sb, err := mc.Sandboxes.Create(ctx, app, image, &modal.SandboxCreateParams{
 	Timeout: 10 * time.Minute,
 })
-defer sb.Detach()
 ```
 
 {/snippet} </CodeTabs>
@@ -286,7 +281,6 @@ sb.wait_until_ready()
 
 # The server is now ready — interact with it via tunnels, exec, etc.
 sb.terminate()
-sb.detach()
 ```
 
 {/snippet}
@@ -305,7 +299,6 @@ await sb.wait_until_ready.aio()
 
 # The server is now ready — interact with it via tunnels, exec, etc.
 await sb.terminate.aio()
-await sb.detach.aio()
 ```
 
 {/snippet}
@@ -359,7 +352,6 @@ func main() {
 		Command:        []string{"python3", "-m", "http.server", "8080"},
 		ReadinessProbe: probe,
 	})
-	defer sb.Detach()
 
 	// Blocks until port 8080 is accepting connections
 	sb.WaitUntilReady(ctx, 5*time.Minute)
@@ -395,7 +387,6 @@ sb.wait_until_ready()
 # The sandbox is now ready
 p = sb.exec("cat", "/tmp/ready")
 sb.terminate()
-sb.detach()
 ```
 
 {/snippet}
@@ -418,7 +409,6 @@ await sb.wait_until_ready.aio()
 # The sandbox is now ready
 p = await sb.exec.aio("cat", "/tmp/ready")
 await sb.terminate.aio()
-await sb.detach.aio()
 ```
 
 {/snippet}
@@ -477,7 +467,6 @@ func main() {
 		Command:        []string{"bash", "-c", "sleep 5 && touch /tmp/ready && sleep 3600"},
 		ReadinessProbe: probe,
 	})
-	defer sb.Detach()
 
 	// Blocks until "test -f /tmp/ready" exits with code 0
 	sb.WaitUntilReady(ctx, 5*time.Minute)
@@ -505,7 +494,6 @@ try:
 except modal.exception.TimeoutError:
     print("Sandbox failed to become ready")
     sb.terminate()
-    sb.detach()
 ```
 
 {/snippet}
@@ -518,7 +506,6 @@ try:
 except modal.exception.TimeoutError:
     print("Sandbox failed to become ready")
     await sb.terminate.aio()
-    await sb.detach.aio()
 ```
 
 {/snippet}
@@ -651,7 +638,6 @@ sb = modal.Sandbox.create(
     volumes={"/data": modal.Volume.from_name("data-volume", create_if_missing=True)},
     app=sb_app,
 )
-sb.detach()
 ```
 
 {/snippet}
@@ -664,7 +650,6 @@ sb = await modal.Sandbox.create.aio(
     volumes={"/data": modal.Volume.from_name("data-volume", create_if_missing=True)},
     app=sb_app,
 )
-await sb.detach.aio()
 ```
 
 {/snippet}
@@ -678,7 +663,6 @@ const sb = await modal.sandboxes.create(app, image, {
   volumes: { "/data": volume },
   workdir: "/repo",
 });
-sb.detach();
 ```
 
 {/snippet}
@@ -692,10 +676,95 @@ sb, err := mc.Sandboxes.Create(ctx, app, image, &modal.SandboxCreateParams{
   Volumes: map[string]*modal.Volume{"/data": volume},
   Workdir: "/repo",
 })
-defer sb.Detach()
 ```
 
 {/snippet} </CodeTabs>
+
+## Runtimes
+
+Sandboxes run on one of two runtimes:
+
+* [**gVisor**](https://gvisor.dev/), a container runtime developed by Google,
+  provides strong isolation and is suitable for most workloads.
+* **VMs** run the Sandbox in a virtual machine with its own Linux kernel. Use
+  the VM runtime for workloads that expect a full Linux environment, such as
+  running Docker inside the Sandbox, mounting
+  [FUSE](https://man7.org/linux/man-pages/man4/fuse.4.html) filesystems, or
+  managing resources with nested
+  [cgroups](https://man7.org/linux/man-pages/man7/cgroups.7.html). Nested
+  virtualization is also available on the
+  [Team and Enterprise plans](/pricing); to request access, reach out via
+  [Slack](/slack) or email us at <support@modal.com>.
+
+Switch runtimes via the `runtime` parameter, or leave unset to let Modal choose for you.
+
+<CodeTabs>
+  {#snippet python()}
+
+```python fixture:sb_app
+sb = modal.Sandbox.create(app=sb_app, runtime="vm")  # or: runtime="gvisor"
+p = sb.exec("uname", "-srn")
+print(p.stdout.read()) # Linux modal 7.2.6
+sb.terminate()
+```
+
+{/snippet}
+
+{#snippet javascript()}
+
+```javascript notest
+const sb = await modal.sandboxes.create(app, image, { runtime: "vm" });
+
+const p = await sb.exec(["uname", "-srn"]);
+console.log(await p.stdout.readText()); // Linux modal 7.2.6
+```
+
+{/snippet}
+
+{#snippet go()}
+
+```go notest
+sb, err := mc.Sandboxes.Create(ctx, app, image, &modal.SandboxCreateParams{
+	Runtime: modal.SandboxRuntimeVM,
+})
+p, err := sb.Exec(ctx, []string{"uname", "-srn"}, nil)
+stdout, err := io.ReadAll(p.Stdout)
+fmt.Println(string(stdout)) // Linux modal 7.2.6
+```
+
+{/snippet} </CodeTabs>
+
+[GPU](/docs/guide/gpu) Sandboxes are only supported with `runtime="gvisor"`.
+
+### Running Docker in a Sandbox
+
+Use the VM runtime to run Docker in a Sandbox. Start `dockerd` as the Sandbox
+entrypoint and run containers with `sb.exec`. Containers on the Docker bridge
+can reach each other, and `/var/lib/docker` is included in
+[Filesystem Snapshots](/docs/guide/sandbox-snapshots#filesystem-snapshots).
+
+```python notest
+image = (
+    modal.Image.from_registry("ubuntu:24.04")
+    .env({"DEBIAN_FRONTEND": "noninteractive"})
+    .apt_install("docker.io")
+)
+
+sb = modal.Sandbox.create(
+    "dockerd",
+    app=sb_app,
+    image=image,
+    runtime="vm",
+    readiness_probe=modal.Probe.with_exec("docker", "info", interval_ms=500),
+)
+sb.wait_until_ready()
+
+p = sb.exec("docker", "run", "--rm", "alpine", "echo", "hello from Docker")
+p.wait()
+print(p.stdout.read())
+
+sb.terminate()
+```
 
 ## Environments
 
@@ -715,7 +784,6 @@ sb = modal.Sandbox.create(
 )
 p = sb.exec("bash", "-c", "echo $MY_SECRET")
 print(p.stdout.read())
-sb.detach()
 ```
 
 {/snippet}
@@ -731,7 +799,6 @@ sb = await modal.Sandbox.create.aio(
 )
 p = await sb.exec.aio("bash", "-c", "echo $MY_SECRET")
 print(await p.stdout.read.aio())
-await sb.detach.aio()
 ```
 
 {/snippet}
@@ -747,7 +814,6 @@ const sb = await modal.sandboxes.create(app, image, {
 });
 const p = await sb.exec(["bash", "-c", "echo $MY_SECRET"]);
 console.log(await p.stdout.readText());
-sb.detach();
 ```
 
 {/snippet}
@@ -761,13 +827,19 @@ image := mc.Images.FromRegistry("python:3.13-slim", nil)
 sb, err := mc.Sandboxes.Create(ctx, app, image, &modal.SandboxCreateParams{
   Secrets: []*modal.Secret{secret},
 })
-defer sb.Detach()
 p, err := sb.Exec(ctx, []string{"bash", "-c", "echo $MY_SECRET"}, nil)
 stdout, err := io.ReadAll(p.Stdout)
 fmt.Println(string(stdout))
 ```
 
 {/snippet} </CodeTabs>
+
+### OIDC identity tokens
+
+Pass `include_oidc_identity_token=True` to `modal.Sandbox.create` to inject a
+`MODAL_IDENTITY_TOKEN` environment variable containing an OIDC token into the
+Sandbox. See the [OIDC integration guide](/docs/guide/oidc-integration) for
+details.
 
 ### Custom Images
 
@@ -884,7 +956,6 @@ app, err = mc.Apps.FromName(ctx, "sandbox-app", &modal.AppFromNameParams{
 
 image, err = mc.Images.FromName(ctx, "sandbox-runtime", nil)
 sb, err := mc.Sandboxes.Create(ctx, app, image, nil)
-defer sb.Detach()
 ```
 
 {/snippet} </CodeTabs>
@@ -908,7 +979,6 @@ image = modal.Image.debian_slim().pip_install("pandas", "numpy")
 
 with modal.enable_output():
     sb = modal.Sandbox.create(image=image, app=sb_app)
-sb.detach()
 ```
 
 {/snippet}
@@ -920,7 +990,6 @@ image = modal.Image.debian_slim().pip_install("pandas", "numpy")
 
 with modal.enable_output():
     sb = await modal.Sandbox.create.aio(image=image, app=sb_app)
-await sb.detach.aio()
 ```
 
 {/snippet}
@@ -933,7 +1002,6 @@ const image = modal.images
   .dockerfileCommands(["RUN pip install pandas numpy"]);
 
 const sb = await modal.sandboxes.create(app, image);
-sb.detach();
 ```
 
 {/snippet}
@@ -946,7 +1014,6 @@ image := mc.Images.FromRegistry("python:3.13-slim", nil).
 
 // Note: Image build logs are automatically streamed in Go
 sb, err := mc.Sandboxes.Create(ctx, app, image, nil)
-defer sb.Detach()
 ```
 
 {/snippet} </CodeTabs>
@@ -965,7 +1032,6 @@ Sandbox constructor:
 sb = modal.Sandbox.create("python", "-m", "http.server", "8080", app=sb_app, timeout=10)
 for line in sb.stdout:
     print(line, end="")
-sb.detach()
 ```
 
 {/snippet}
@@ -976,7 +1042,6 @@ sb.detach()
 sb = await modal.Sandbox.create.aio("python", "-m", "http.server", "8080", app=sb_app, timeout=10)
 async for line in sb.stdout:
     print(line, end="")
-await sb.detach.aio()
 ```
 
 {/snippet}
@@ -988,7 +1053,6 @@ const sb = await modal.sandboxes.create(app, image, {
   command: ["python", "-m", "http.server", "8080"],
   timeoutMs: 10 * 1000,
 });
-sb.detach();
 ```
 
 {/snippet}
@@ -1000,7 +1064,6 @@ sb, err := mc.Sandboxes.Create(ctx, app, image, &modal.SandboxCreateParams{
   Command: []string{"python", "-m", "http.server", "8080"},
   Timeout: 10 * time.Second,
 })
-sb.Detach()
 ```
 
 {/snippet} </CodeTabs>
@@ -1019,7 +1082,6 @@ If you have a running Sandbox, you can retrieve it using the `from_id` method.
 ```python fixture:sb_app
 sb = modal.Sandbox.create(app=sb_app)
 sb_id = sb.object_id
-sb.detach()
 
 # ... later in the program ...
 
@@ -1027,7 +1089,6 @@ sb2 = modal.Sandbox.from_id(sb_id)
 p = sb2.exec("echo", "hello")
 print(p.stdout.read())
 sb2.terminate()
-sb2.detach()
 ```
 
 {/snippet}
@@ -1037,7 +1098,6 @@ sb2.detach()
 ```python fixture:sb_app
 sb = await modal.Sandbox.create.aio(app=sb_app)
 sb_id = sb.object_id
-await sb.detach.aio()
 
 # ... later in the program ...
 
@@ -1045,7 +1105,6 @@ sb2 = await modal.Sandbox.from_id.aio(sb_id)
 p = await sb2.exec.aio("echo", "hello")
 print(await p.stdout.read.aio())
 await sb2.terminate.aio()
-await sb2.detach.aio()
 ```
 
 {/snippet}
@@ -1055,7 +1114,6 @@ await sb2.detach.aio()
 ```javascript notest
 const sb = await modal.sandboxes.create(app, image);
 const sbId = sb.sandboxId;
-await sb.detach();
 
 // ... later in the program ...
 
@@ -1071,12 +1129,11 @@ await sb2.terminate();
 
 ```go notest
 sb, err := mc.Sandboxes.Create(ctx, app, image, nil)
-defer sb.Detach()
 sbId := sb.SandboxID
 
 // ... later in the program ...
 
-sb2, err := mc.Sandboxes.FromID(ctx, sbId)
+sb2, err := mc.Sandboxes.FromID(ctx, sbId, nil)
 defer sb2.Terminate(ctx, nil)
 p, err := sb2.Exec(ctx, []string{"echo", "hello"}, nil)
 stdout, err := io.ReadAll(p.Stdout)
@@ -1157,8 +1214,6 @@ sb1 = modal.Sandbox.create(app=sb_app, name="my-name")
 # deployed App named "my-app".
 sb2 = modal.Sandbox.from_name("my-app", "my-name")
 assert sb1.object_id == sb2.object_id # sb1 and sb2 refer to the same Sandbox
-sb1.detach()
-sb2.detach()
 ```
 
 {/snippet}
@@ -1172,8 +1227,6 @@ sb1 = await modal.Sandbox.create.aio(app=sb_app, name="my-name")
 # deployed App named "my-app".
 sb2 = await modal.Sandbox.from_name.aio("my-app", "my-name")
 assert sb1.object_id == sb2.object_id # sb1 and sb2 refer to the same Sandbox
-await sb1.detach.aio()
-await sb2.detach.aio()
 ```
 
 {/snippet}
@@ -1187,8 +1240,6 @@ const sb1 = await modal.sandboxes.create(app, image, { name: "my-name" });
 // deployed App named "my-app".
 const sb2 = await modal.sandboxes.fromName("my-app", "my-name");
 console.assert(sb1.sandboxId === sb2.sandboxId); // sb1 and sb2 refer to the same Sandbox
-sb1.detach();
-sb2.detach();
 ```
 
 {/snippet}
@@ -1207,8 +1258,6 @@ sb1, err := mc.Sandboxes.Create(ctx, app, image, &modal.SandboxCreateParams{
 sb2, err := mc.Sandboxes.FromName(ctx, "my-app", "my-name", nil)
 // sb1 and sb2 refer to the same Sandbox
 fmt.Println(sb1.SandboxID == sb2.SandboxID)
-defer sb1.Detach()
-defer sb2.Detach()
 ```
 
 {/snippet} </CodeTabs>
@@ -1245,9 +1294,6 @@ for sandbox in modal.Sandbox.list(
     tags={"major_version": "1", "minor_version": "2"},
 ):  # Just the latest sandbox.
     print(sandbox.object_id)
-
-sandbox_v1_1.detach()
-sandbox_v1_2.detach()
 ```
 
 {/snippet}
@@ -1275,9 +1321,6 @@ async for sandbox in modal.Sandbox.list.aio(
     tags={"major_version": "1", "minor_version": "2"},
 ):  # Just the latest sandbox.
     print(sandbox.object_id)
-
-await sandbox_v1_1.detach.aio()
-await sandbox_v1_2.detach.aio()
 ```
 
 {/snippet}
@@ -1315,8 +1358,6 @@ for await (const sandbox of modal.sandboxes.list({
 })) {
   console.log(sandbox.sandboxId);
 }
-sandboxV1_1.detach();
-sandboxV1_2.detach();
 ```
 
 {/snippet}
@@ -1330,8 +1371,6 @@ sandboxV1_1, err := mc.Sandboxes.Create(ctx, app, image, &modal.SandboxCreatePar
 sandboxV1_2, err := mc.Sandboxes.Create(ctx, app, image, &modal.SandboxCreateParams{
   Command: []string{"sleep", "20"},
 })
-defer sandboxV1_1.Detach()
-defer sandboxV1_2.Detach()
 
 sandboxV1_1.SetTags(ctx, map[string]string{"major_version": "1", "minor_version": "1"})
 sandboxV1_2.SetTags(ctx, map[string]string{"major_version": "1", "minor_version": "2"})
@@ -1365,12 +1404,19 @@ for sandbox := range it {
 
 {/snippet} </CodeTabs>
 
-## Cleaning up Client-side Connections
+## Cleaning up client-side resources
 
-Unlike other Modal objects, the local Sandbox will hold a direct connection to
-its compute substrate. While this connection should be automatically closed
-during garbage collection, we recommend explicitly cleaning up the resources
-once you are finished interacting with the Sandbox by calling its `detach()` method:
+When you use a Sandbox handle in the SDK to interact with a Sandbox (e.g.,
+calling `exec()`), it opens a direct connection to the remote Sandbox and keeps
+it open for subsequent commands. This connection and related resources are
+cleaned up automatically once they have been idle for a while, so you normally
+don't need to manage them yourself.
+
+However, if your client manages a large number of Sandboxes, you can release
+these resources eagerly by calling `detach()` on the Sandbox. This permanently
+closes all connections from that handle and prevents it from opening new ones.
+Detaching doesn't terminate or otherwise affect the remote Sandbox; it only
+cleans up client-side resources.
 
 <CodeTabs>
   {#snippet python()}
@@ -1408,10 +1454,3 @@ defer sb.Detach()
 ```
 
 {/snippet} </CodeTabs>
-
-After calling `detach`, any operation using the Sandbox object is not guaranteed to
-work. If you want to continue interacting with a running Sandbox, use `Sandbox.from_id`
-to get a new Sandbox object that references the original Sandbox. In the Python SDK,
-`terminate` leaves your Sandbox attached, so we recommend calling `detach` after you
-are done with your terminated Sandbox. In the Go/JS SDK, `Terminate` will also detach
-your Sandbox.

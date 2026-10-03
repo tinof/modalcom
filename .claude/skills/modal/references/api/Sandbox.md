@@ -30,13 +30,13 @@ access object metadata, such as its ID.
 create(*args, app=None, name=None, tags=None, image=None, env=None,
     secrets=None, network_file_systems={}, timeout=300, idle_timeout=None,
     workdir=None, gpu=None, cloud=None, region=None, cpu=None, memory=None,
-    block_network=False, outbound_cidr_allowlist=None,
-    outbound_domain_allowlist=None, inbound_cidr_allowlist=None, volumes={},
-    pty=False, encrypted_ports=[], h2_ports=[], unencrypted_ports=[],
-    custom_domain=None, proxy=None, include_oidc_identity_token=False,
-    readiness_probe=None, verbose=False, experimental_options=None,
-    _experimental_enable_snapshot=False, client=None, environment_name=None,
-    pty_info=None, cidr_allowlist=None)
+    runtime=None, block_network=False, outbound_cidr_allowlist=None,
+    outbound_domain_allowlist=None, _experimental_outbound_policy=None,
+    inbound_cidr_allowlist=None, volumes={}, pty=False, encrypted_ports=[],
+    h2_ports=[], unencrypted_ports=[], custom_domain=None, proxy=None,
+    include_oidc_identity_token=False, readiness_probe=None, verbose=False,
+    experimental_options=None, _experimental_enable_snapshot=False, client=None,
+    environment_name=None, pty_info=None, cidr_allowlist=None)
 ```
 Create a new Sandbox to run untrusted, arbitrary code.
 
@@ -60,9 +60,11 @@ The Sandbox's corresponding container will be created asynchronously.
 <Parameter name="region" type="str | Sequence[str] | None" defaultValue="None" description="Region or regions to run the sandbox on." />
 <Parameter name="cpu" type="float | tuple[float, float] | None" defaultValue="None" description="Specify, in fractional CPU cores, how many CPU cores to request. Or, pass (request, limit) to additionally specify a hard limit in fractional CPU cores. CPU throttling will prevent a container from exceeding its specified limit." />
 <Parameter name="memory" type="int | tuple[int, int] | None" defaultValue="None" description="Specify, in MiB, a memory request which is the minimum memory required. Or, pass (request, limit) to additionally specify a hard limit in MiB." />
+<Parameter name="runtime" type="SandboxRuntime | None" defaultValue="None" description="Runtime under which the Sandbox executes, or None to let Modal pick." />
 <Parameter name="block_network" type="bool" defaultValue="False" description="Whether to block network access." />
 <Parameter name="outbound_cidr_allowlist" type="Sequence[str] | None" defaultValue="None" description="List of CIDRs the sandbox is allowed to access. If None, all CIDRs are allowed." />
 <Parameter name="outbound_domain_allowlist" type="Sequence[str] | None" defaultValue="None" description="List of domain names the sandbox is allowed to access. Supports wildcard prefixes (``*.``); a bare ``&quot;*&quot;`` allows all domains. The outbound policy can be replaced later via `Sandbox._experimental_set_outbound_network_policy`." />
+<Parameter name="_experimental_outbound_policy" type="_OutboundPolicy | None" defaultValue="None" description="Configuration for replacing headers in outbound HTTPS requests from the Sandbox. Secrets referenced by the policy are resolved outside the Sandbox and are never visible to the workload. See `modal.experimental.OutboundPolicy`. This API is experimental and may change in the future." />
 <Parameter name="inbound_cidr_allowlist" type="Sequence[str] | None" defaultValue="None" description="List of CIDRs allowed to connect inbound to the sandbox (tunnels and connection tokens). If None, all CIDRs are allowed." />
 <Parameter name="volumes" type="dict[str | os.PathLike, _Volume | _CloudBucketMount]" defaultValue="&#123;&#125;" description="Mount points for Modal Volumes and CloudBucketMounts." />
 <Parameter name="pty" type="bool" defaultValue="False" description="Enable a PTY for the Sandbox entrypoint command. When enabled, all output (stdout and stderr from the process) is multiplexed into stdout, and the stderr stream is effectively empty." />
@@ -103,11 +105,14 @@ sandbox.wait()
 ```python
 detach(self)
 ```
-Disconnects your client from the sandbox and cleans up resources assoicated with the connection.
+Disconnects your client from the sandbox and cleans up resources associated with the connection.
 
 Be sure to only call `detach` when you are done interacting with the sandbox. After calling `detach`,
 any operation using the Sandbox object is not guaranteed to work anymore. If you want to continue interacting
 with a running sandbox, use `Sandbox.from_id` to get a new Sandbox object.
+
+This method does not interrupt or wait for running concurrent operations on the sandbox. Resources are
+promptly closed once those operations complete.
 
 ## from_name
 
@@ -493,15 +498,21 @@ Copy a file from the Sandbox to a local path.
 Parent directories for `local_path` are created if needed.
 The local file is overwritten if it already exists.
 
+**Parameters**
+
+<Parameter name="remote_path" type="str" description="Absolute path to the file in the Sandbox." />
+<Parameter name="local_path" type="str | os.PathLike" description="Path to the file on the local machine." />
+
 **Raises**
 
-- `SandboxFilesystemNotFoundError`: the remote path does not exist.
-- `SandboxFilesystemIsADirectoryError`: the remote path points to a directory.
-- `SandboxFilesystemPermissionError`: read permission is denied in the Sandbox.
-- `SandboxFilesystemError`: the command fails for any other reason.
-- `IsADirectoryError`: `local_path` points to a directory.
-- `NotADirectoryError`: a component of the `local_path` parent is not a directory.
-- `PermissionError`: writing `local_path` is not permitted.
+- `SandboxFilesystemNotFoundError`: The remote path does not exist.
+- `SandboxFilesystemIsADirectoryError`: The remote path points to a directory.
+- `SandboxFilesystemFileTooLargeError`: The file exceeds the read size limit.
+- `SandboxFilesystemPermissionError`: Read permission is denied in the Sandbox.
+- `SandboxFilesystemError`: The command fails for any other reason.
+- `IsADirectoryError`: ``local_path`` points to a directory.
+- `NotADirectoryError`: A component of the ``local_path`` parent is not a directory.
+- `PermissionError`: Writing ``local_path`` is not permitted.
 
 **Usage**
 
@@ -594,6 +605,7 @@ Raw bytes read from the file.
 
 - `SandboxFilesystemNotFoundError`: The path does not exist.
 - `SandboxFilesystemIsADirectoryError`: The path points to a directory.
+- `SandboxFilesystemFileTooLargeError`: The file exceeds the read size limit.
 - `SandboxFilesystemPermissionError`: Read permission is denied.
 - `SandboxFilesystemError`: The command fails for any other reason.
 
@@ -626,6 +638,7 @@ File contents decoded as UTF-8.
 
 - `SandboxFilesystemNotFoundError`: The path does not exist.
 - `SandboxFilesystemIsADirectoryError`: The path points to a directory.
+- `SandboxFilesystemFileTooLargeError`: The file exceeds the read size limit.
 - `SandboxFilesystemPermissionError`: Read permission is denied.
 - `SandboxFilesystemError`: The command fails for any other reason.
 
@@ -691,12 +704,20 @@ Return metadata for a single file, directory, or symlink in the Sandbox.
 `remote_path` must be an absolute path in the Sandbox. If `remote_path` is a symlink, the returned
 `FileInfo` object describes the symlink, not the target it points to.
 
+**Parameters**
+
+<Parameter name="remote_path" type="str" description="Absolute path in the Sandbox." />
+
+**Returns**
+
+A `FileInfo` object describing the path.
+
 **Raises**
 
-- `SandboxFilesystemNotFoundError`: the path does not exist.
-- `SandboxFilesystemNotADirectoryError`: a non-leaf component of the path is not a directory.
-- `SandboxFilesystemPermissionError`: a component of the path is not searchable.
-- `SandboxFilesystemError`: the command fails for any other reason.
+- `SandboxFilesystemNotFoundError`: The path does not exist.
+- `SandboxFilesystemNotADirectoryError`: A non-leaf component of the path is not a directory.
+- `SandboxFilesystemPermissionError`: A component of the path is not searchable.
+- `SandboxFilesystemError`: The command fails for any other reason.
 
 **Usage**
 
@@ -720,23 +741,25 @@ directory, events for entries directly inside it are reported. Set
 If `remote_path` is a symlink, it is followed and events reference
 paths under the resolved target.
 
-Yields `FileWatchEvent` objects as changes occur, until either
-`timeout` seconds elapse, the iterator is closed, or the Sandbox
-is terminated.
+**Parameters**
 
-Optionally restrict the kinds of events emitted to those included
-in `filter`. The default filter `None` permits all event types.
+<Parameter name="remote_path" type="str" description="Absolute path in the Sandbox to watch." />
+<Parameter name="filter" type="Optional[list[FileWatchEventType]]" defaultValue="None" description="Restrict the kinds of events emitted to those included in the list. The default ``None`` permits all event types." />
+<Parameter name="recursive" type="bool" defaultValue="False" description="When ``True``, also report events for all nested subdirectories." />
+<Parameter name="timeout" type="Optional[int]" defaultValue="None" description="Number of seconds to watch for. ``None`` means watch indefinitely." />
 
-`timeout` is in seconds. `None` means watch indefinitely. When
-`timeout` elapses, the iterator stops without raising an exception.
+**Yields**
+
+`FileWatchEvent` objects as changes occur, until either ``timeout`` seconds
+elapse, the iterator is closed, or the Sandbox is terminated. When ``timeout``
+elapses, the iterator stops without raising an exception.
 
 **Raises**
 
-- `SandboxFilesystemNotFoundError`: `remote_path` does not exist.
-- `SandboxFilesystemPermissionError`: watch access is denied.
-- `InvalidError`: the filesystem at `remote_path` does not support
-  watching.
-- `SandboxFilesystemError`: the command fails for any other reason.
+- `SandboxFilesystemNotFoundError`: ``remote_path`` does not exist.
+- `SandboxFilesystemPermissionError`: Watch access is denied.
+- `InvalidError`: The filesystem at ``remote_path`` does not support watching.
+- `SandboxFilesystemError`: The command fails for any other reason.
 
 **Usage**
 
@@ -811,91 +834,6 @@ The remote file is overwritten if it already exists.
 sandbox.filesystem.write_text("Hello, world!\n", "/tmp/hello.txt")
 ```
 
-## open
-
-```python
-open(self, path, mode="r")
-```
-[Alpha] Open a file in the Sandbox and return a FileIO handle.
-
-**Deprecated (2026-03-09):** Use the `Sandbox.filesystem` APIs instead for improved reliability.
-
-See the [`FileIO`](https://modal.com/docs/sdk/py/latest/file_io#fileio)
-docs for more information.
-
-**Parameters**
-
-<Parameter name="path" type="str" description="Absolute path of the file inside the sandbox." />
-<Parameter name="mode" type="Union[_typeshed.OpenTextMode, _typeshed.OpenBinaryMode]" defaultValue="&quot;r&quot;" description="File open mode (text or binary), following built-in ``open`` conventions." />
-
-**Returns**
-
-A `FileIO` handle for reading or writing the remote file.
-
-**Usage**
-
-```python notest
-sb = modal.Sandbox.create(app=sb_app)
-f = sb.open("/test.txt", "w")
-f.write("hello")
-f.close()
-```
-
-## ls
-
-```python
-ls(self, path)
-```
-[Alpha] List the contents of a directory in the Sandbox.
-
-**Deprecated (2026-04-15):** Use `Sandbox.filesystem.list_files()` instead for improved reliability.
-
-**Parameters**
-
-<Parameter name="path" type="str" description="Absolute directory path inside the sandbox." />
-
-**Returns**
-
-Entry names in the directory as a list of strings.
-
-## mkdir
-
-```python
-mkdir(self, path, parents=False)
-```
-[Alpha] Create a new directory in the Sandbox.
-
-**Deprecated (2026-04-15):** Use `Sandbox.filesystem.make_directory()` instead for improved reliability.
-
-## rm
-
-```python
-rm(self, path, recursive=False)
-```
-[Alpha] Remove a file or directory in the Sandbox.
-
-**Deprecated (2026-04-15):** Use `Sandbox.filesystem.remove()` instead for improved reliability.
-
-## watch
-
-```python
-watch(self, path, filter=None, recursive=None, timeout=None)
-```
-[Alpha] Watch a file or directory in the Sandbox for changes.
-
-**Deprecated (2026-05-08):** Use `Sandbox.filesystem.watch()` instead for improved reliability.
-
-**Parameters**
-
-<Parameter name="path" type="str" description="Absolute path to watch." />
-<Parameter name="filter" type="builtins.list[FileWatchEventType] | None" defaultValue="None" description="Optional list of event types to include." />
-<Parameter name="recursive" type="bool | None" defaultValue="None" description="Whether to watch subdirectories; None uses server defaults." />
-<Parameter name="timeout" type="int | None" defaultValue="None" description="Optional timeout for the watch stream." />
-
-**Returns**
-
-An async iterator of `FileWatchEvent` values.
-
 ## stdout
 
 ```python
@@ -960,3 +898,72 @@ Sandboxes that have at least those tags are returned.
 **Returns**
 
 An async generator yielding `Sandbox` objects.
+
+## logs
+
+
+```python
+logs: SandboxLogsManager
+```
+
+Access logs for a `Sandbox` entrypoint.
+
+Useful for inspecting logs after a Sandbox terminates.
+Use [`fetch()`](#logsfetch)
+to read logs from a UTC time range, [`tail()`](#logstail)
+to read the most recent logs.
+
+Note that the logs from executed commands in the sandbox (via `exec()`) are not included in the
+entrypoint logs.
+
+**See Also**
+
+- [`modal app logs`](https://modal.com/docs/cli/latest/app#modal-app-logs):
+  CLI access to logs for an App.
+
+
+### logs.fetch
+
+```python
+fetch(self, *, since, until=None, source=None, search_text="")
+```
+Fetch Sandbox logs corresponding to the date range and filters.
+
+**Parameters**
+
+<Parameter name="since" type="datetime" description="Start date to fetch logs from. Must be in UTC or timezone-naive, which is interpreted as local time." />
+<Parameter name="until" type="datetime | None" defaultValue="None" description="Defaults to current date if None. Must be in UTC or timezone-naive, which is interpreted as local time." />
+<Parameter name="source" type="LogSource | None" defaultValue="None" description="Filter by source: &#x27;stdout&#x27;, &#x27;stderr&#x27;, or &#x27;system&#x27;." />
+<Parameter name="search_text" type="str" defaultValue="&quot;&quot;" description="Filter by search text." />
+
+**Yields**
+
+`LogEntry` objects in chronological order.
+
+**Usage**
+
+```python notest
+sandbox = modal.Sandbox.from_name("my-app", "sandbox")
+
+for entry in sandbox.logs.fetch(
+    since=datetime.now() - timedelta(minutes=25),
+    source="stdout",
+):
+    print(entry.message, end="")
+```
+
+### logs.tail
+
+```python
+tail(self, entries=100, *, source=None)
+```
+Fetch the most recent Sandbox logs.
+
+**Parameters**
+
+<Parameter name="entries" type="int" defaultValue="100" description="The number of log entries to return." />
+<Parameter name="source" type="LogSource | None" defaultValue="None" description="Filter by source: &#x27;stdout&#x27;, &#x27;stderr&#x27;, or &#x27;system&#x27;." />
+
+**Yields**
+
+`LogEntry` objects in chronological order.

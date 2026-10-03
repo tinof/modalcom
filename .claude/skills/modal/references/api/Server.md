@@ -127,6 +127,86 @@ for entry in server.logs.stream(timeout=60):
     print(entry.message, end="")
 ```
 
+## sessions
+
+
+```python
+sessions: ServerSessionsManager
+```
+
+Start and terminate sticky sessions on a Server decorated with `@modal.sessioned()`.
+
+
+### sessions.start
+
+```python
+start(self, idle_timeout=600)
+```
+Start a sticky session and return its ID and token.
+
+Requests to the server URL that carry the returned token are routed to the same container until the
+session has had no connections for `idle_timeout` seconds or is terminated. A container won't be scaled down
+for as long as it holds a live session.
+
+**Parameters**
+
+<Parameter name="idle_timeout" type="int" defaultValue="600" description="Seconds without an in-flight request before the session ends." />
+
+**Usage**
+
+```python notest
+server = modal.Server.from_name("my-app", "MyServer")
+server_url = server.get_url()
+session = server.sessions.start(idle_timeout=600)
+headers = {"Modal-Authorization": f"Bearer {session.token}"}
+
+requests.get(server_url, headers=headers).raise_for_status()
+
+server.sessions.terminate(session.token)
+```
+
+### sessions.terminate
+
+```python
+terminate(self, token)
+```
+Terminate a sticky session.
+
+New requests to it will be rejected. The container continues serving other sessions.
+
+**Parameters**
+
+<Parameter name="token" type="str" description="The `token` of the `ServerSessionCredentials` to terminate." />
+
+**Usage**
+
+```python notest
+server = modal.Server.from_name("my-app", "MyServer")
+session = server.sessions.start()
+
+server.sessions.terminate(session.token)
+```
+
+## info
+
+```python
+info(self, *, refresh=False)
+```
+Get an overview of a Server's resource requests, associated mounts, http config, etc.
+
+This method performs a network request to populate this information if the Server handle is
+a remote lookup whose information has not yet been fetched (e.g. from `Server.from_name(...)`),
+or if `refresh=True`.
+
+**Parameters**
+
+<Parameter name="refresh" type="bool" defaultValue="False" description="Always perform a network request. Pass `refresh=True` to ensure that this method returns the most up to date information." />
+
+**Returns**
+
+This returns a [`modal.types.ServerInfo`](https://modal.com/docs/sdk/py/latest/types#ServerInfo)
+dataclass.
+
 ## get_url
 
 ```python
@@ -208,3 +288,44 @@ Reference a Server from a deployed App by its name.
 This is a lazy method that defers hydrating the local
 object with metadata from Modal servers until the first
 time it is actually used.
+
+## from_id
+
+```python
+from_id(cls, server_id, *, client=None)
+```
+Reference a Server from a deployed or running App by its ID.
+
+This is a lazy method that defers hydrating the local
+object with metadata from Modal servers until the first
+time it is actually used.
+
+**Parameters**
+
+<Parameter name="server_id" type="str" description="The ID of the server." />
+<Parameter name="client" type="_Client | None" defaultValue="None" description="Modal client instance for this session." />
+
+**Usage**
+
+```python notest
+server = modal.Server.from_id("fu-456")
+```
+
+## stats
+
+```python
+stats(self, *, since=None, until=None, container=None)
+```
+Return statistics for a modal Server.
+
+The default time range is the most recent hour. The maximum time range is 7 days.
+
+**Parameters**
+
+<Parameter name="since" type="datetime | None" defaultValue="None" description="The beginning of the time range, inclusive. If omitted, this defaults to an hour before `until`. Values without a timezone are interpeted as local time." />
+<Parameter name="until" type="datetime | None" defaultValue="None" description="The end of the time range, exclusive. If omitted, this defaults to current time. Values without a timezone are interpeted as local time." />
+<Parameter name="container" type="str | None" defaultValue="None" description="If passed in, the stats are computed for only this container. Default None." />
+
+**Returns**
+
+A `ServerStats` object

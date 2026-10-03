@@ -59,6 +59,36 @@ client = modal.Client.from_credentials("my_token_id", "my_token_secret")
 modal.Sandbox.create("echo", "hi", client=client, app=app)
 ```
 
+## from_oauth_credentials
+
+```python
+from_oauth_credentials(cls, refresh_token, *, oauth_client_id,
+    oauth_client_secret)
+```
+Constructor based on OAuth credentials; useful for managing Modal on behalf of third-party users.
+
+**Parameters**
+
+<Parameter name="refresh_token" type="str" description="OAuth refresh token returned by Modal&#x27;s token endpoint." />
+<Parameter name="oauth_client_id" type="str" description="Modal-issued OAuth client ID, with an `oc-` prefix." />
+<Parameter name="oauth_client_secret" type="str" description="Modal-issued OAuth client secret, with an `ov-` prefix." />
+
+**Returns**
+
+An authenticated `Client` with its connection opened.
+
+**Usage**
+
+```python notest
+client = modal.Client.from_oauth_credentials(
+    refresh_token,
+    oauth_client_id=oauth_client_id,
+    oauth_client_secret=oauth_client_secret,
+)
+
+modal.Sandbox.create("echo", "hi", client=client, app=app)
+```
+
 ## get_input_plane_metadata
 
 ```python

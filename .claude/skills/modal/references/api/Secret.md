@@ -215,8 +215,8 @@ With `path` set, walks upward from that file or directory to find `filename`.
 
 **Parameters**
 
-<Parameter name="path" type="" defaultValue="None" description="File or directory to search from; omit to search from the process cwd." />
-<Parameter name="filename" type="" defaultValue="&quot;.env&quot;" description="Name of the env file to find (default ``.env``)." />
+<Parameter name="path" type="str | Path | None" defaultValue="None" description="File or directory to search from; omit to search from the process cwd." />
+<Parameter name="filename" type="str" defaultValue="&quot;.env&quot;" description="Name of the env file to find (default ``.env``)." />
 <Parameter name="client" type="_Client | None" defaultValue="None" description="Modal client used when hydrating the Secret." />
 
 **Returns**

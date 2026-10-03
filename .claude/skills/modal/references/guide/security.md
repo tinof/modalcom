@@ -53,7 +53,8 @@ components we deploy on our network.
 * Compute jobs at Modal are containerized and virtualized using
   [gVisor](https://github.com/google/gvisor), the sandboxing technology
   developed at Google and used in their *Google Cloud Run* and *Google
-  Kubernetes Engine* cloud services.
+  Kubernetes Engine* cloud services. Sandboxes may also run on Modal's
+  secure [VM runtime](/docs/guide/sandboxes#runtimes).
 * We conduct annual business continuity and security incident exercises.
 
 ## Vulnerability remediation

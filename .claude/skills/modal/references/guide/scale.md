@@ -1,6 +1,6 @@
 # Scaling out
 
-Modal makes it trivially easy to scale compute across thousands of containers.
+Modal makes it easy to scale compute across thousands of containers.
 You won't have to worry about your App crashing if it goes viral or need to wait
 a long time for your batch jobs to complete.
 
@@ -201,13 +201,4 @@ the [GPU section](/docs/guide/gpu) for more information.
 
 ## Scaling Limits
 
-Modal enforces the following limits for every function:
-
-* 2,000 pending inputs (inputs that haven't been assigned to a container yet)
-* 25,000 total inputs (which include both running and pending inputs)
-
-For inputs created with `.spawn()` for async jobs, Modal allows up to 1 million pending inputs instead of 2,000.
-
-If you try to create more inputs and exceed these limits, you'll receive a `Resource Exhausted` error, and you should retry your request later. If you need higher limits, please reach out!
-
-Additionally, each `.map()` invocation can process at most 1000 inputs concurrently.
+Modal enforces various platform limits that affect scalability. Limits on the total number of concurrent containers (and the total number of GPUs in concurrent use) depend on your workspace's [plan level](/pricing). There is also a hard limit of 4,000 concurrent containers running for a single Function. Other limits apply at the level of individual inputs and depend on the specific Function [invocation method](/docs/guide/function-invocation-methods).

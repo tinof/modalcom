@@ -2,7 +2,7 @@
 
 i6pn (IPv6 private networking) is Modal's private container-to-container networking solution. It allows users to create clusters of Modal containers which can send network traffic to each other with low latency and high bandwidth (≥ 50Gbps).
 
-Normally, `modal.Function` containers can initiate outbound network connections to the internet but they are not directly addressable by other containers. i6pn-enabled containers, on the other hand, can be directly connected to by other i6pn-enabled containers and this is a key enabler of Modal's Beta `@modal.experimental.clustered` functionality.
+Normally, `modal.Function` containers can initiate outbound network connections to the internet but they are not directly addressable by other containers. i6pn-enabled containers, on the other hand, can be directly connected to by other i6pn-enabled containers and this is a key enabler of [Modal Clusters](/docs/guide/multi-node-clusters).
 
 You can enable i6pn on any `modal.Function`:
 
@@ -35,7 +35,7 @@ The upshot of this is that only containers in the same Workspace can see each ot
 
 Modal operates a [global fleet](/docs/guide/region-selection) and allows containers to run on multiple cloud providers and in many regions. i6pn networking is however region-scoped functionality, meaning that only i6pn-enabled containers in the same region can perform network communication.
 
-Modal's i6pn-enabled primitives such as `@modal.experimental.clustered` automatically restrict container geographic placement and cloud placement to ensure inter-container connectivity.
+Modal's i6pn-enabled primitives such as `@modal.clustered` automatically restrict container geographic placement and cloud placement to ensure inter-container connectivity.
 
 ## Public network access to cluster networking
 

@@ -210,7 +210,8 @@ get_call_graph(self)
 Fetch information about the graph of Inputs this FunctionCall is part of.
 
 Note: the call graph data is not populated in real-time, and its capture is best-effort.
-We do not recommend relying on this method for critical use cases.
+Large call graphs may be truncated. We do not recommend relying on this method
+for critical use cases.
 
 See the [`modal.types`](/docs/sdk/py/latest/types) reference for information
 on the return values.

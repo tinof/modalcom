@@ -136,27 +136,48 @@ sb, _ := mc.Sandboxes.Create(ctx, app, image, &modal.SandboxCreateParams{
 See [Resource limits](/docs/guide/resources#resource-limits) for details on
 how CPU and memory limits behave.
 
+### Disk
+
+Sandboxes have the same [disk limits](/docs/guide/resources#disk-limits) as
+other Modal containers, and their disk size cannot be increased. On the
+[VM runtime](/docs/guide/sandboxes#runtimes), the root filesystem is a fixed
+512 GiB.
+
 ## Tuning your requests
 
-For maximum cost-efficiency, base your requests on observed usage percentiles rather than peaks:
-around p50–75 for CPU and p90–95 for memory.
+We recommend basing your resource requests on observed usage percentiles rather
+than peaks: around p50–75 for CPU and p90–95 for memory.
 
-If your observed usage is consistently higher than your request, you may
-run into resource contention on the host. This can manifest as OOM errors or CPU throttling.
+Because Sandboxes can burst above their request, you generally want to
+request less than you'd think and let bursting cover the rest. The Sandboxes
+tab on an App page has metrics to help you find the right request size:
+**CPU Per Sandbox**, **Memory Per Sandbox**, **CPU Pressure Per Sandbox**, and
+**Exit Reasons**.
 
-The goal should be to set requests that correspond to your base load while letting bursting handle occasional spikes.
+![Resource-sizing charts on the Sandboxes metrics tab](https://modal-cdn.com/cdnbot/resource-sizing-chartswb81a46v_6e4fd1b8.webp)
 
-1. Start with default values for CPU and memory.
+CPU Per Sandbox and Memory Per Sandbox show percentiles of how much CPU and
+memory your Sandboxes actually use. And CPU Pressure Per Sandbox and Exit Reasons
+tell you if a request is too low. CPU Pressure Per Sandbox tracks time Sandboxes
+spent stalled waiting for CPU; Exit Reasons tracks Sandboxes evicted while
+exceeding their memory request.
 
-2. Run your typical workload and observe actual resource usage
-   in the [Modal dashboard](/apps) to understand your baseline needs.
+1. Start with the [default request values](/docs/guide/resources) for CPU
+   and memory, which are used when you omit the `cpu` and `memory` parameters.
 
-3. Set your request to match the resource level your workload consistently needs.
+2. Run your typical workload and check CPU Per Sandbox and Memory Per
+   Sandbox to see your actual usage.
+
+3. Set your requests to around p50–75 for CPU and p90–95 for memory, then check
+   CPU Pressure Per Sandbox and Exit Reasons to confirm that throttling and
+   evictions are at acceptable levels. If they aren't, raise the resource request
+   as necessary.
 
 ## GPU Sandboxes
 
 You can also run Sandboxes with GPUs. See [GPU acceleration](/docs/guide/gpu) for available
-GPU types and configuration.
+GPU types and configuration. GPU Sandboxes are only supported with
+[`runtime="gvisor"`](/docs/guide/sandboxes#runtimes).
 
 Unlike CPU Sandboxes, GPU Sandboxes are subject to [preemption](/docs/guide/preemption).
 Design your GPU workloads to handle interruptions gracefully.

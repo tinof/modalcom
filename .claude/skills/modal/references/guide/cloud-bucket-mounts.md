@@ -219,6 +219,7 @@ The most common issues that users encounter are:
 * Files cannot be opened in append mode.
 * Files cannot be written to at arbitrary offsets i.e. `seek` and write are not supported together.
 * To write to a file, you must open it in `truncate` mode.
+* Bucket traffic does not exit through a [Proxy](/docs/guide/proxy-ips).
 
 These operations typically result in a `PermissionError: [Errno 1] Operation not permitted` error.
 

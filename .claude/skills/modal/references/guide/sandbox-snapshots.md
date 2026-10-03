@@ -104,9 +104,8 @@ To manage storage for long-lived snapshots, you can delete them programmatically
 
 ## Filesystem Snapshots
 
-Filesystem Snapshots are copies of the Sandbox's filesystem at a given point in time.
-These Snapshots are [Images](/docs/sdk/py/latest/Image) and can be used to create
-new Sandboxes.
+Filesystem Snapshots are copies of the Sandbox's root filesystem at a given point in time.
+These Snapshots are [Images](/docs/sdk/py/latest/Image) and can be used to create new Sandboxes.
 
 To create a Filesystem Snapshot, you can use the
 [`Sandbox.snapshot_filesystem()`](/docs/sdk/py/latest/Sandbox#snapshot_filesystem) method:
@@ -133,6 +132,91 @@ from your base image, so only modified files are stored. Restoring a Filesystem 
 utilizes the same infrastructure we use to get fast cold starts for your Sandboxes.
 
 See [Snapshot Retention](#snapshot-retention) for TTL configuration options and [Deleting Snapshots](#deleting-snapshots) to learn how to manage snapshot storage.
+
+Note that a Filesystem Snapshot only covers the Sandbox's root filesystem.
+Any mounted [Volumes](/docs/guide/volumes) are not covered by this Snapshot
+and will not be included in the resulting Image.
+
+### Forking
+
+Since Filesystem Snapshots are [Images](/docs/reference/modal.Image), you can create multiple Sandboxes from the same snapshot. Each Sandbox starts with an identical copy of the snapshotted filesystem, so you can use this to run parallel workloads or test different changes independently.
+
+<CodeTabs>
+  {#snippet python()}
+
+```python notest
+import modal
+
+app = modal.App.lookup("sandbox-fork-example", create_if_missing=True)
+
+sb = modal.Sandbox.create(app=app)
+p = sb.exec("bash", "-c", "pip install numpy && echo 'setup done' > /status")
+p.wait()
+
+image = sb.snapshot_filesystem()
+sb.terminate()
+
+# Start multiple Sandboxes from the same snapshot
+sb2 = modal.Sandbox.create(image=image, app=app)
+sb3 = modal.Sandbox.create(image=image, app=app)
+
+# Each fork starts from the snapshotted state
+assert sb2.exec("cat", "/status").stdout.read().strip() == "setup done"
+assert sb3.exec("cat", "/status").stdout.read().strip() == "setup done"
+```
+
+{/snippet}
+{#snippet javascript()}
+
+```javascript notest
+const sb = await modal.sandboxes.create(app, image);
+const p = await sb.exec([
+  "bash",
+  "-c",
+  "pip install numpy && echo 'setup done' > /status",
+]);
+await p.wait();
+
+const snapshot = await sb.snapshotFilesystem();
+await sb.terminate();
+
+// Start multiple Sandboxes from the same snapshot
+const sb2 = await modal.sandboxes.create(app, snapshot);
+const sb3 = await modal.sandboxes.create(app, snapshot);
+
+// Each fork starts from the snapshotted state
+const p2 = await sb2.exec(["cat", "/status"]);
+console.assert((await p2.stdout.readText()).trim() === "setup done");
+const p3 = await sb3.exec(["cat", "/status"]);
+console.assert((await p3.stdout.readText()).trim() === "setup done");
+```
+
+{/snippet}
+{#snippet go()}
+
+```go notest
+sb, _ := mc.Sandboxes.Create(ctx, app, image, nil)
+p, _ := sb.Exec(ctx, []string{"bash", "-c", "pip install numpy && echo 'setup done' > /status"}, nil)
+p.Wait(ctx, nil)
+
+snapshot, _ := sb.SnapshotFilesystem(ctx, nil)
+sb.Terminate(ctx, nil)
+
+// Start multiple Sandboxes from the same snapshot
+sb2, _ := mc.Sandboxes.Create(ctx, app, snapshot, nil)
+sb3, _ := mc.Sandboxes.Create(ctx, app, snapshot, nil)
+
+// Each fork starts from the snapshotted state
+p2, _ := sb2.Exec(ctx, []string{"cat", "/status"}, nil)
+stdout2, _ := io.ReadAll(p2.Stdout)
+fmt.Println(strings.TrimSpace(string(stdout2))) // "setup done"
+
+p3, _ := sb3.Exec(ctx, []string{"cat", "/status"}, nil)
+stdout3, _ := io.ReadAll(p3.Stdout)
+fmt.Println(strings.TrimSpace(string(stdout3))) // "setup done"
+```
+
+{/snippet} </CodeTabs>
 
 ## Directory Snapshots
 
@@ -197,7 +281,6 @@ const snapshot = await sb.snapshotDirectory("/project");
 
 // Ok to throw away the old Sandbox at this point
 await sb.terminate();
-sb.detach();
 
 // Mount the snapshot in a new Sandbox
 const sb2 = await modal.sandboxes.create(app, image);
@@ -212,7 +295,6 @@ try {
 // The Sandbox now has access to the previous project state
 const p2 = await sb2.exec(["cat", "/project/file.txt"]);
 console.assert((await p2.stdout.readText()).trim() === "data");
-sb2.detach();
 ```
 
 {/snippet}
@@ -220,7 +302,6 @@ sb2.detach();
 
 ```go notest
 sb, _ := mc.Sandboxes.Create(ctx, app, image, nil)
-defer sb.Detach()
 
 // Write some dummy data
 p, _ := sb.Exec(ctx, []string{"bash", "-c", "mkdir /project && echo 'data' > /project/file.txt"}, nil)
@@ -234,7 +315,6 @@ sb.Terminate(ctx, nil)
 
 // Mount the snapshot in a new Sandbox
 sb2, _ := mc.Sandboxes.Create(ctx, app, image, nil)
-defer sb2.Detach()
 
 if err := sb2.MountImage(ctx, "/project", snapshot, nil); err != nil {
   var notFound modal.NotFoundError
@@ -363,7 +443,10 @@ snapshot_2 = sandbox_2._experimental_snapshot()
 * Snapshotting a Sandbox will currently cause it to terminate. We intend to remove this limitation soon.
 * Sandboxes created with `_experimental_enable_snapshot=True` or restored from Snapshots cannot run with GPUs.
 * It is not possible to snapshot a Sandbox while a `Sandbox.exec` command is still running. Furthermore, any background processes launched by a call to `Sandbox.exec` will not be properly restored after a snapshot.
-* Sandbox memory snapshots can only be restored on the same exact instance type that the original Sandbox was run on. Given Modal's diverse fleet of capacity, this can sometimes lead to scheduling delays, especially when memory snapshots are combined with narrow region pinning.
+* A Sandbox created with `_experimental_enable_snapshot=True` can only be restored on the same exact instance type that the original Sandbox was run on. Given Modal's diverse fleet of capacity, this can sometimes lead to scheduling delays.
+* A Sandbox created with `_experimental_enable_snapshot=True` cannot pin its `region`, and a Sandbox restored from a Memory Snapshot is scheduled wherever the original instance type is available.
+* Memory Snapshots for Sandboxes that specify `runtime="vm"` are only available to a set of enabled customers. If you're interested, reach out via [Slack](/slack) or email us at <support@modal.com>.
+* Sandboxes that specify `runtime="vm"` cannot mount Volumes when created with `_experimental_enable_snapshot=True`.
 
 ## Persisting Sandbox State
 

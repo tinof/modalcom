@@ -72,13 +72,14 @@ hitting our gRPC payload size limits.
 
 The size limit is currently 100MB.
 
-## Outdated kernel version (4.4.0)
+## Outdated kernel version (4.19.0)
 
-Our secure runtime [reports a misleadingly old](https://github.com/google/gvisor/issues/11117) kernel version, 4.4.0.
+gVisor, one of our secure runtimes, [reports a misleadingly old](https://github.com/google/gvisor/issues/11117) kernel version, `4.19.0-gvisor`.
 Certain software libraries will detect this and report a warning. These warnings can be ignored because the runtime
 actually implements Linux kernel features from versions 5.15+.
 
 If the outdated kernel version reporting creates errors in your application please contact us [in our Slack](https://modal.com/slack).
+Alternatively, the [VM runtime](/docs/guide/sandboxes#runtimes) runs a real, up-to-date Linux kernel.
 
 ## CUDA driver initialization failed on L4 GPU type
 

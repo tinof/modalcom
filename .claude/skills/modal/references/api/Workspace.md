@@ -161,15 +161,40 @@ See [the guide](https://modal.com/docs/guide/webhook-proxy-auth) for more inform
 ### proxy_tokens.create
 
 ```python
-create(self)
+create(self, name="")
 ```
 Create a new proxy token for the Workspace.
+
+**Parameters**
+
+<Parameter name="name" type="str" defaultValue="&quot;&quot;" description="An optional name to help identify the token." />
 
 **Usage**
 
 ```python notest
-token = modal.Workspace.from_context().proxy_tokens.create()
+token = modal.Workspace.from_context().proxy_tokens.create(name="production-webhooks")
 print(token.token_id, token.token_secret)
+```
+
+### proxy_tokens.update
+
+```python
+update(self, proxy_token_id, *, name)
+```
+Update a proxy token in the Workspace.
+
+An empty name removes the token's name.
+
+**Parameters**
+
+<Parameter name="proxy_token_id" type="str" description="The token ID (`wk-...`) to update." />
+<Parameter name="name" type="str" description="The updated name for the token." />
+
+**Usage**
+
+```python notest
+ws = modal.Workspace.from_context()
+ws.proxy_tokens.update(token_id, name="production-webhooks")
 ```
 
 ### proxy_tokens.list

@@ -2,6 +2,8 @@
 
 Modal makes it easy to run your code on [GPUs](/gpu-glossary/readme).
 
+Using a GPU requires having a valid payment method on file.
+
 ## Quickstart
 
 Here's a simple example of a Function running on an A100 in Modal:

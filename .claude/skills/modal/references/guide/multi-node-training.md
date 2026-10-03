@@ -1,166 +1,163 @@
-# Multi-node clusters
+# Multi-node training
 
-<Callout variant="beta" />
+When you need maximum control over your training loop and infrastructure, you can use a [Clustered Function](/docs/guide/multi-node-clusters).
 
-Modal supports running a training job across several coordinated containers. Each container can saturate the available GPU devices on its host (aka node) and communicate with peer containers which do the same. By scaling a training job from a single GPU to 16 GPUs you can achieve nearly 16x improvements in training time.
+This guide covers how to spin one up for frameworks based on [torchrun](https://docs.pytorch.org/docs/2.14/elastic/run.html) or [Ray](https://docs.ray.io/en/latest/index.html),
+which supports [RDMA](/docs/guide/multi-node-clusters#rdma). See [here](/docs/examples/miles_grpo) for an example that does just that.
 
-### Cluster compute capability
+## torchrun
 
-Modal clusters provide:
-
-* A 50 Gbps [IPv6 private network](https://modal.com/docs/guide/private-networking) for orchestration, dataset downloading, etc.
-* A 3,200 Gbps RDMA scale-out network ([RoCE](https://en.wikipedia.org/wiki/RDMA_over_Converged_Ethernet)).
-* Up to 64 devices.
-* At least 1 TB of RAM and 4 TB of local NVMe SSD per node.
-* Deep burn-in testing.
-* Interoperability with all Modal platform functionality ([Volumes](/docs/guide/volumes), [Dicts](/docs/guide/dicts), [Tunnels](/docs/guide/tunnels), etc.).
-
-The guide will walk you through how the Modal client library enables multi-node training and integrates with `torchrun`.
-
-### `@clustered`
-
-Unlike standard Modal Function containers, containers in a multi-node training job must be able to:
-
-1. Perform fast, direct network communication between each other.
-2. Be scheduled together, all or nothing, at the same time.
-
-The `@clustered` decorator enables this behavior.
+To use a torchrun-based framework on Modal, first create a container image with the [necessary dependencies](/docs/guide/multi-node-clusters#rdma) and [add your training script](/docs/guide/images#add-local-files-with-add_local_dir-and-add_local_file):
 
 ```python
-import modal.experimental
+LOCAL_CODE_DIR = "train"
+REMOTE_CODE_DIR = "/root/train"
+REMOTE_BENCH_SCRIPT_PATH = f"{REMOTE_CODE_DIR}/benchmark.py"
 
-@app.function(
-    gpu="H100:8",
-    timeout=60 * 60 * 24,
-    retries=modal.Retries(initial_delay=0.0, max_retries=10),
+cuda_version = "12.4.0"  # should be no greater than host CUDA version
+flavor = "devel"  #  includes full CUDA toolkit
+operating_sys = "ubuntu22.04"
+tag = f"{cuda_version}-{flavor}-{operating_sys}"
+
+image = (
+    modal.Image.from_registry(f"nvidia/cuda:{tag}", add_python="3.12")
+    .apt_install("libibverbs1")
+    .uv_pip_install("torch")
+    .add_local_dir(
+        LOCAL_CODE_DIR,
+        remote_path=REMOTE_CODE_DIR,
+    )
 )
-@modal.experimental.clustered(size=4)
-def train_model():
-    cluster_info = modal.experimental.get_cluster_info()
-
-    container_rank = cluster_info.rank
-    world_size = len(cluster_info.container_ips)
-    main_addr = cluster_info.container_ips[0]
-    is_main = "(main)" if container_rank == 0 else ""
-
-    print(f"{container_rank=} {is_main} {world_size=} {main_addr=}")
-    ...
 ```
 
-Applying this decorator under `@app.function` modifies the Function so that remote calls to it are serviced by a multi-node container group. The above configuration creates a group of four containers each having 8 H100 GPU devices, for a total of 32 devices.
+Then, create a Clustered Function with RDMA configured and start `torchrun` with the training script. In this example, we create a two-node cluster with eight H100s per node:
+
+```python continuation
+N_NODES = 2
+N_GPUS_PER_NODE = 8
+
+@app.function(
+    gpu=f"H100:{N_GPUS_PER_NODE}",
+    image=image,
+    timeout=60 * 60,
+)
+@modal.clustered(size=N_NODES, rdma=True)
+def run():
+    from torch.distributed.run import parse_args, run
+
+    cluster = modal.Cluster.from_context()
+    args = [
+        f"--nnodes={N_NODES}",
+        f"--nproc-per-node={N_GPUS_PER_NODE}",
+        f"--node-rank={cluster.container_rank()}",
+        f"--master-addr={cluster.container_ips()[0]}",
+        REMOTE_BENCH_SCRIPT_PATH,
+    ]
+
+    run(parse_args(args))
+```
+
+Be sure to set the appropriate [GPU type](/docs/guide/gpu) and [timeout](/docs/guide/timeouts) for your workload.
+Clusters must use the [full number of GPU devices per node](/docs/guide/gpu#specifying-gpu-count).
+
+## Ray
+
+To set up a [Ray cluster](https://docs.ray.io/en/latest/index.html) on a Clustered Function, gather information about the cluster and IPv4 addresses from `modal.Cluster.from_context()`.
+Then, start a head node on rank 0 and a worker node on other ranks:
+
+```python continuation
+N_NODES = 2
+N_GPUS_PER_NODE = 8
+
+@app.function(
+    gpu=f"H100:{N_GPUS_PER_NODE}",
+    image=image,
+    timeout=24 * 60 * 60,
+)
+@modal.clustered(size=N_NODES, rdma=True)
+async def train():
+    cluster = modal.Cluster.from_context()
+    ips = cluster.container_ips(family="ipv4")
+    rank = cluster.container_rank()
+
+    my_ip = ips[rank]
+    head_ip = ips[0]
+
+    # Set any environment variables needed for Ray itself here...
+    os.environ["HOST_IP"] = my_ip
+
+    if rank == 0:
+        await run_head(my_ip)
+    else:
+        await run_worker(my_ip, head_ip)
+```
 
 <Callout variant="info">
 
-Starting May 31st, 2026, clustered functions must use the full number of GPU devices per node (e.g. `H100:4` is invalid but `H100:8` is valid). Clustered functions require GPUs, and CPU-only functions are not supported. If you have a special case that does not fall under above and would like to use clustered functions, please contact <support@modal.com>.
+Ray only works with IPv4. Be sure to set `family="ipv4"` when you request IP addresses for containers.
 
 </Callout>
 
-## Scheduling
-
-A `modal.experimental.clustered` Function runs on multiple nodes in our cloud, but executes like a normal function call. For example, all nodes are scheduled together ([gang scheduling](https://en.wikipedia.org/wiki/Gang_scheduling)) so that your code runs on all of the requested hardware or not at all.
-
-Traditionally this kind of cluster and scheduling management would be handled by SLURM, Kubernetes, or manually. But with Modal it's all provided serverlessly with just a Python decorator!
-
-### Rank & input broadcast
-
-![diagram](https://modal-cdn.com/cdnbot/multinodepmgnla70_4b57a155.webp)
-
-You may notice above that a single `.remote` Function call created three input executions but returned only one output. This is how input-output is structured for multi-node training jobs on Modal. The Function call’s arguments are replicated to each container, but only the rank zero container’s is returned to the caller.
-
-A container’s rank is a key concept in multi-node jobs. Rank zero is the 'leader' rank and typically coordinates the job. Rank zero is also known as the "main" container. Rank zero's output will always be the output of a multi-node training run.
-
-## Networking
-
-Function containers cannot normally make direct network connections to other Function containers, but this is a requirement for multi-node training communication. So, along with gang scheduling, the `@clustered` decorator enables Modal’s workspace-private inter-container networking called [i6pn](https://www.notion.so/Multi-node-docs-1281e7f16949806f966adedfe8b2cb74?pvs=21).
-
-The [cluster networking guide](/docs/guide/private-networking) goes into more detail on i6pn, but the upshot is that each container in the cluster is made aware of the network address of all the other containers in the cluster, enabling them to communicate with each other quickly via [TCP](https://pytorch.org/docs/stable/elastic/rendezvous.html).
-
-### RDMA (Infiniband)
-
-Clusters are equipped with Infiniband providing up to 3,200 Gbps scale-out bandwidth for inter-node communication.
-RDMA scale-out networking is enabled with the `rdma` parameter of `modal.experimental.clustered`.
-
-```python notest
-@modal.experimental.clustered(size=2, rdma=True)
-def train():
-    ...
-```
-
-To run a simple Infiniband RDMA performance test see the [this sample code](https://github.com/modal-labs/multinode-training-guide/tree/main/benchmark).
-
-## Cluster Info
-
-`modal.experimental.get_cluster_info()` exposes the following information about the cluster:
-
-* `rank: int` is the current container's order within the cluster, starting from `0`, the leader.
-* `cluster_id: str` is the unique identifier for the cluster.
-* `container_ips: list[str]` contains the IPv6 addresses of each container in the cluster, sorted by rank.
-* `container_ipv4_ips: list[str]` contains the IPv4 addresses of each container in the cluster, sorted by rank.
-
-## Fault Tolerance
-
-For a clustered Function, failures in inputs and containers are handled differently.
-
-If an input fails on any container, this failure **is not propagated** to other containers in the cluster. Containers are responsible for detecting and responding to input failures on other containers.
-
-Only rank 0's output matters: if an input fails on the leader container (rank 0), the input is marked as failed, even if the input succeeds on another container. Similarly, if an input succeeds on the leader container but fails on another container, the input will still be marked as successful.
-
-If a container in the cluster is preempted, or if the leader container (rank 0) fails, Modal will terminate all remaining containers in the cluster, and retry the input.
-
-### Input Synchronization
-
-***Important:*** synchronization is not relevant for single training runs, and applies mostly to inference use-cases.
-
-Modal does not synchronize input execution across containers. Containers are responsible for ensuring that they do not process inputs faster than other containers in their cluster.
-
-In particular, it is important that the leader container (rank 0) only starts processing the next input after all other containers have finished processing the current input.
-
-## Examples
-
-To get hands-on with multi-node training you can jump into the [`Modal Training Gym`](https://gym.modal.dev), [`multinode-training-guide` repository](https://github.com/modal-labs/multinode-training-guide), or [`modal-examples` repository](https://github.com/modal-labs/modal-examples/tree/main/14_clusters) and `modal run` something!
-
-* [Simple ‘hello world’ 4 x 1 H100 torch cluster example](https://github.com/modal-labs/modal-examples/blob/main/14_clusters/simple_torch_cluster.py)
-* [Infiniband RDMA performance test](https://github.com/modal-labs/multinode-training-guide/tree/main/benchmark)
-* [Use 2 x 8 H100s to train a ResNet50 model on the ImageNet dataset](https://github.com/modal-labs/multinode-training-guide/tree/main/resnet50)
-* [Speedrun GPT-2 training with modded-nanogpt](https://github.com/modal-labs/multinode-training-guide/tree/main/nanoGPT)
-
-<!-- - Use 2 x 8 H100s to run multi-node _inference_ on LLaMA 3.1 405B in 16bit precision. **[TODO]** -->
-
-### Torchrun Example
+Rank 0 should launch a Ray head node and wait for it to start up. Once it does, it can construct a train command and submit it to the cluster, then keep itself alive while forwarding logs:
 
 ```python
-import modal
-import modal.experimental
+async def run_head(my_ip):
+    import ray
+    from ray.job_submission import JobSubmissionClient
 
-image = (
-    modal.Image.debian_slim(python_version="3.12")
-    .pip_install("torch~=2.5.1", "numpy~=2.2.1")
-    .add_local_dir(
-        "training", remote_path="/root/training"
+    subprocess.Popen(
+        [
+            "ray",
+            "start",
+            "--head",
+            f"--node-ip-address={my_ip}",
+            "--dashboard-host=0.0.0.0",
+        ]
     )
-)
-app = modal.App("example-simple-torch-cluster", image=image)
 
-n_nodes = 4
+    # Wait for the Ray head to start up
+    for _ in range(30):
+        try:
+            ray.init(address="auto")
+            break
+        except Exception:
+            await asyncio.sleep(1)
+    else:
+        raise RuntimeError("Failed to connect to Ray head")
 
-@app.function(gpu=f"H100:8", timeout=60 * 60 * 24)
-@modal.experimental.clustered(size=n_nodes, rdma=True)
-def launch_torchrun():
-    # import the 'torchrun' interface directly.
-    from torch.distributed.run import parse_args, run
+    cmd = build_train_cmd()
+    runtime_env = {
+        "env_vars": {
+            "no_proxy": f"127.0.0.1,{my_ip}",
+            "MASTER_ADDR": my_ip,
+            # Any other environment variables for your workload...
+        }
+    }
 
-    cluster_info = modal.experimental.get_cluster_info()
+    client = JobSubmissionClient("http://127.0.0.1:8265")
+    job_id = client.submit_job(entrypoint=cmd, runtime_env=runtime_env)
 
-    run(
-        parse_args(
-            [
-                f"--nnodes={n_nodes}",
-                f"--node-rank={cluster_info.rank}",
-                f"--master-addr={cluster_info.container_ips[0]}",
-                "--nproc-per-node=8",
-                "--master-port=1234",
-                "training/train.py",
-            ]
-        )
+    # Forward logs to the Modal dashboard
+    async with modal.forward(8265) as tunnel:
+        print(f"Ray dashboard: {tunnel.url}")
+        async for line in client.tail_job_logs(job_id):
+            print(line, end="", flush=True)
+```
+
+Other ranks simply start Ray as a worker node and provide it the IP of the head node. They then loop to keep themselves alive while the job runs:
+
+```python
+async def run_worker(my_ip, head_ip):
+    subprocess.Popen(
+        [
+            "ray",
+            "start",
+            f"--node-ip-address={my_ip}",
+            "--address",
+            f"{head_ip}:6379",
+        ]
     )
+
+    while True:
+        await asyncio.sleep(10)
 ```

@@ -129,6 +129,7 @@ video_processing_image = (
     .env({"LD_LIBRARY_PATH": tensorrt_ld_path, "LANG": "en_US.UTF-8"})
     # install system dependencies
     .apt_install("python3-opencv", "ffmpeg")
+    .run_commands("printf 'onnxruntime\\n' > /tmp/onnxruntime-excludes.txt")
     # install Python dependencies
     .uv_pip_install(
         "pipecat-ai[webrtc]==1.5.0",
@@ -138,6 +139,7 @@ video_processing_image = (
         "opencv-python==4.11.0.86",
         "tensorrt==10.9.0.34",
         "torch==2.7.0",
+        extra_options="--excludes /tmp/onnxruntime-excludes.txt",
     )
 )
 

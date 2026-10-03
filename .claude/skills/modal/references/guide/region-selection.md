@@ -28,7 +28,7 @@ A multiplier on top of our [base usage pricing](/pricing) will be applied to any
 
 | **Region type**         | **Multiplier** |
 | ----------------------- | -------------- |
-| Broad (e.g. `us`)       | 1.5x           |
+| Broad (e.g. `us`)       | 1.15x          |
 | Narrow (e.g. `us-west`) | 1.75x          |
 
 Here's an example: let's say you have a Function or Sandbox container that uses 1 T4, 1 CPU core, and 1GB memory. You've specified that it should run in `us-west`. The cost to run it for 1 hour would be `((T4 hourly cost) + (CPU hourly cost for one core) + (Memory hourly cost for one GB)) * 1.75`.
@@ -61,24 +61,22 @@ Modal offers different levels of granularity for container regions. Use broader 
                  "jp"                 Japan
                  "au"                 Australia
 ------------------------------------------------------------
-  "uk"                                United Kingdom
+                 "uk"                 United Kingdom
 ------------------------------------------------------------
-  "ca"                                Canada
+                 "ca"                 Canada
 ------------------------------------------------------------
-  "me"                                Middle East
+                 "me"                 Middle East
 ------------------------------------------------------------
-  "sa"                                South America
+                 "sa"                 South America
 ------------------------------------------------------------
-  "af"                                Africa
+                 "af"                 Africa
 ------------------------------------------------------------
-  "mx"                                Mexico
+                 "mx"                 Mexico
 ```
 
 Need access to more granular region definitions? Contact <sales@modal.com>.
 
 ## Regional routing
-
-<Callout variant="beta" />
 
 In addition to letting you specify the region a Function's containers run in, Modal also allows you to specify which region your inputs and outputs will be routed through to reduce network overhead. By default, this is `us-east` (Virginia, USA).
 
@@ -98,7 +96,6 @@ The valid options for `routing_region=` are:
 
 * `us-east` (Virginia, USA)
 * `us-west` (Oregon, USA)
-* `ca-central` (Montreal, Canada)
 * `eu-west` (Dublin, Ireland)
 * `ap-south` (Mumbai, India)
 

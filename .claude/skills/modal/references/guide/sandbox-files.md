@@ -26,7 +26,6 @@ contents = sb.filesystem.read_text("/tmp/test.txt")
 print(contents)
 
 sb.terminate()
-sb.detach()
 ```
 
 {/snippet}
@@ -117,7 +116,6 @@ sb.filesystem.copy_to_local("/tmp/file-in-sandbox.txt", "local-file-copy.txt")
 print(Path("local-file-copy.txt").read_text())
 
 sb.terminate()
-sb.detach()
 ```
 
 {/snippet}
@@ -202,7 +200,6 @@ if info.size > 0:
 sb.filesystem.remove("/tmp/project", recursive=True)
 
 sb.terminate()
-sb.detach()
 ```
 
 {/snippet}
@@ -311,7 +308,6 @@ p.wait()
 p = sb.exec("bash", "-c", "echo foo > /cache/a.txt")
 p.wait()
 sb.terminate(wait=True)
-sb.detach()
 
 # Access the Volume file from outside the Sandbox.
 for data in vol.read_file("a.txt"):
@@ -352,7 +348,6 @@ sb = modal.Sandbox.create(
 p = sb.exec("bash", "-c", "echo hello > /data/output.txt")
 p.wait()
 sb.terminate(wait=True)
-sb.detach()
 ```
 
 {/snippet}
@@ -435,7 +430,6 @@ if p.returncode != 0:
 
 # Changes are now persisted and visible to other containers
 sb.terminate()
-sb.detach()
 ```
 
 This is particularly useful for long-running Sandboxes where you want to
@@ -469,5 +463,4 @@ sb = modal.Sandbox.create(app=my_app, image=image)
 p = sb.exec("ls", "/app")
 print(p.stdout.read())
 p.wait()
-sb.detach()
 ```

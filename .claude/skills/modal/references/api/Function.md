@@ -164,6 +164,32 @@ f.update_autoscaler(max_containers=5)
 f.update_autoscaler(scaledown_window=300)
 ```
 
+## from_id
+
+```python
+from_id(cls, function_id, *, client=None)
+```
+Reference a Function from a deployed or running App by its ID.
+
+This is a lazy method that defers hydrating the local
+object with metadata from Modal servers until the first
+time it is actually used.
+
+**Parameters**
+
+<Parameter name="function_id" type="str" description="ID of the function." />
+<Parameter name="client" type="_Client | None" defaultValue="None" description="Modal client to use; defaults to `Client.from_env()` when omitted." />
+
+**Returns**
+
+A lazy `Function` handle.
+
+**Usage**
+
+```python
+f = modal.Function.from_id("fu-123")
+```
+
 ## from_name
 
 ```python
@@ -198,6 +224,26 @@ The `version` parameter allows you to invoke a version-pinned function:
 ```python
 f_v3 = modal.Function.from_name("other-app", "function", version=3)
 ```
+
+## info
+
+```python
+info(self, *, refresh=False)
+```
+Get an overview of a Function's resource requests, associated mounts, etc.
+
+This method performs a network request to populate this information if the Function handle is
+a remote lookup whose information has not yet been fetched (e.g. from `Function.from_name(...)`),
+or if `refresh=True`.
+
+**Parameters**
+
+<Parameter name="refresh" type="bool" defaultValue="False" description="Always perform a network request. Pass `refresh=True` to ensure that this method returns the most up to date information." />
+
+**Returns**
+
+This returns a [`modal.types.FunctionInfo`](https://modal.com/docs/sdk/py/latest/types#FunctionInfo)
+dataclass.
 
 ## get_web_url
 
@@ -342,27 +388,36 @@ A [`modal.FunctionCall`](https://modal.com/docs/sdk/py/latest/FunctionCall) obje
 that can later be polled or waited for using
 [`.get(timeout=...)`](https://modal.com/docs/sdk/py/latest/FunctionCall#get).
 
-## get_raw_f
-
-```python
-get_raw_f(self)
-```
-Return the inner Python object wrapped by this Modal Function.
-
-**Returns**
-
-The original function object registered with Modal.
-
 ## get_current_stats
 
 ```python
 get_current_stats(self)
 ```
-Return a `FunctionStats` object describing the current function's queue and runner counts.
+Return a snapshot of the Function's current input and container state.
 
 **Returns**
 
-Snapshot counts for backlog, runners, and running inputs.
+A `FunctionCurrentStats` object containing live input and container counts.
+
+## stats
+
+```python
+stats(self, *, since=None, until=None, container=None, all_variants=False)
+```
+Return statistics for a modal Function.
+
+The default time range is the most recent hour. The maximum time range is 7 days.
+
+**Parameters**
+
+<Parameter name="since" type="datetime | None" defaultValue="None" description="The beginning of the time range, inclusive. If omitted, this defaults to an hour before `until`. Values without a timezone are interpeted as local time." />
+<Parameter name="until" type="datetime | None" defaultValue="None" description="The end of the time range, exclusive. If omitted, this defaults to current time. Values without a timezone are interpeted as local time." />
+<Parameter name="container" type="str | None" defaultValue="None" description="If passed in, the stats are computed for only this container. Default None." />
+<Parameter name="all_variants" type="bool" defaultValue="False" description="If True, aggregate the base Function and its variants." />
+
+**Returns**
+
+A `FunctionStats` object
 
 ## map
 

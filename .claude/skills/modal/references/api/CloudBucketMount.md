@@ -1,10 +1,6 @@
 # CloudBucketMount
 
 
-```python
-class CloudBucketMount(object)
-```
-
 Mounts a cloud bucket to your container. Currently supports AWS S3 buckets.
 
 S3 buckets are mounted using [AWS S3 Mountpoint](https://github.com/awslabs/mountpoint-s3).
@@ -95,9 +91,14 @@ def f():
     subprocess.run(["ls", "/my-mount"], check=True)
 ```
 
-```python
-__init__(self, bucket_name, bucket_endpoint_url=None, key_prefix=None,
-    secret=None, oidc_auth_role_arn=None, read_only=False, requester_pays=False,
-    force_path_style=False)
-```
+**Attributes**
+
+<Parameter name="bucket_name" type="str" description="Name of the cloud bucket to mount." />
+<Parameter name="bucket_endpoint_url" type="str | None" defaultValue="None" description="Endpoint URL of the bucket. Required for Cloudflare R2 and Google Cloud Storage buckets, which are identified by their endpoint hostname." />
+<Parameter name="key_prefix" type="str | None" defaultValue="None" description="Prefix prepended to every object path in the bucket. Must end in `/`." />
+<Parameter name="secret" type="_Secret | None" defaultValue="None" description="Credentials used to access the bucket. A private bucket requires a secret containing `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`; a publicly accessible bucket needs none." />
+<Parameter name="oidc_auth_role_arn" type="str | None" defaultValue="None" description="Role ARN to assume when accessing the bucket with OIDC authentication instead of static credentials." />
+<Parameter name="read_only" type="bool" defaultValue="False" description="Mount the bucket read-only." />
+<Parameter name="requester_pays" type="bool" defaultValue="False" description="Whether the bucket is configured as Requester Pays, so that the caller is billed for requests. Requires `secret`." />
+<Parameter name="force_path_style" type="bool" defaultValue="False" description="Address objects as `&lt;endpoint&gt;/&lt;bucket&gt;/&lt;key&gt;` rather than using virtual-hosted-style bucket subdomains." />
 

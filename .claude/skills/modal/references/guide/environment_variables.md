@@ -17,11 +17,10 @@ The following variables are present in every Modal container:
   provider the Modal container is running within.
 * **`MODAL_IMAGE_ID`** — The ID of the
   [`modal.Image`](/docs/sdk/py/latest/Image) used by the Modal container.
-* **`MODAL_REGION`** — This will correspond to a geographic area identifier from
-  the cloud provider associated with the Modal container (see above). For AWS, the
-  identifier is a "region". For GCP it is a "zone", and for OCI it is an
-  "availability domain". Example values are `us-east-1` (AWS), `us-central1`
-  (GCP), `us-ashburn-1` (OCI). See the [full list here](/docs/guide/region-selection#container-region-options).
+* **`MODAL_REGION`** — A
+  [container region](/docs/guide/region-selection#container-region-options)
+  name: the narrow option when one exists (for example `us-east`, `uk`) and
+  otherwise the broad option (for example `us`, `eu`).
 * **`MODAL_TASK_ID`** — The ID of the container running the Modal Function or Sandbox.
 
 ## Function runtime environment variables

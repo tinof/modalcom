@@ -7,8 +7,8 @@ decide what to click or type next, take that action, and look again.
 This example builds one with [Browser Use](https://docs.browser-use.com/).
 An open-weights model served from a Modal
 [Endpoint](https://modal.com/docs/guide/endpoints) powers the agent. The agent
-drives Chromium inside a Modal
-[VM Sandbox](https://modal.com/docs/guide/vm-sandboxes),
+drives Chromium inside a Modal Sandbox running in a
+[VM](https://modal.com/docs/guide/sandboxes#runtimes),
 while a small web UI embeds a noVNC desktop so you can watch it work in real-time.
 
 ## Run the example
@@ -180,7 +180,7 @@ AGENT_SCRIPT = textwrap.dedent(
 
 ```
 
-## Creating the shared Endpoint
+## Creating the dedicated Endpoint
 
 The Endpoint can take time to become ready because its containers scale to zero.
 Startup waits in two places:
@@ -292,9 +292,6 @@ async def start_session(task: str):
         if sandbox is not None:
             await sandbox.terminate.aio()
         raise
-    finally:
-        if sandbox is not None:
-            await sandbox.detach.aio()
 
 
 ```
@@ -330,14 +327,11 @@ async def session_status(sandbox_id: str):
     except modal.exception.NotFoundError as exc:
         raise fastapi.HTTPException(404, "Session not found.") from exc
 
-    try:
-        returncode = await sandbox.poll.aio()
-        if returncode is None:
-            return {"state": "running"}
-        stdout = await sandbox.stdout.read.aio()
-        stderr = await sandbox.stderr.read.aio()
-    finally:
-        await sandbox.detach.aio()
+    returncode = await sandbox.poll.aio()
+    if returncode is None:
+        return {"state": "running"}
+    stdout = await sandbox.stdout.read.aio()
+    stderr = await sandbox.stderr.read.aio()
 
     if returncode == 0:
         result = None
@@ -412,10 +406,7 @@ def test_session(
         raise RuntimeError(f"Unexpected session state: {status}")
 
     sandbox = modal.Sandbox.from_id(sandbox_id)
-    try:
-        sandbox.terminate()
-    finally:
-        sandbox.detach()
+    sandbox.terminate()
     print("session start ok")
 
 
@@ -425,10 +416,9 @@ def test_session(
 
 Each Sandbox uses the agent process as its entrypoint, so it stops when the
 task finishes or its timeout expires. Startup failures terminate it
-immediately, and every code path detaches its local Sandbox handle.
-`test_session` also terminates the Sandbox after the API check.
+immediately, and `test_session` terminates the Sandbox after the API check.
 
-Stop `modal serve` with `Ctrl-C`. The shared Endpoint scales to zero when idle,
+Stop `modal serve` with `Ctrl-C`. The dedicated Endpoint scales to zero when idle,
 but remains available for later prompts. Shut it down when you are done:
 
 ```bash

@@ -13,8 +13,12 @@ You can integrate your Modal Workspace with Slack to receive timely essential no
 
 * Alerts for failed scheduled function runs.
 * Alerts for crash-looping containers in a function.
+* Alerts for Functions whose warm containers have run no inputs for weeks.
 * Alerts when any of your apps have client versions that are out of date.
 * Alerts when you hit your GPU resource limits.
+* Alerts when your Workspace approaches or reaches its usage limit or budget.
+* Alerts when an Environment approaches or reaches its budget.
+* Notices when credits are added to your Workspace.
 
 ## Slack Permissions
 

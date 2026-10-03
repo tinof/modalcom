@@ -1,6 +1,34 @@
 # Guide
 
-- Custom container images
+- Guide
+  - [Introduction to Modal](./intro.md)
+  - [Getting started](./getting-started.md)
+- Functions
+  - [Functions](./functions.md)
+  - [Invocation methods](./function-invocation-methods.md)
+  - [Function lookups](./trigger-deployed-functions.md)
+  - [Container lifecycle management](./lifecycle-functions.md)
+  - [Parametrized Functions](./parametrized-functions.md)
+  - [Dynamic configuration](./dynamic-function-config.md)
+- Sandboxes
+  - [Sandboxes](./sandboxes.md)
+  - [Running commands](./sandbox-spawn.md)
+  - [Networking and security](./sandbox-networking.md)
+  - [File access](./sandbox-files.md)
+  - [Snapshots](./sandbox-snapshots.md)
+  - [Pricing and resources](./sandbox-resources.md)
+  - [Sidecars (Beta)](./sandbox-sidecars.md)
+  - [Secret injection (Beta)](./sandbox-secret-injection.md)
+- Endpoints
+  - [Endpoints](./endpoints.md)
+  - [Shared Endpoints](./shared-endpoints.md)
+  - [Dedicated Endpoints](./dedicated-endpoints.md)
+  - [Endpoint integrations](./endpoint-integrations.md)
+- Training
+  - [Quickstart](./training-quickstart.md)
+  - [Tinker-compatible API](./spindle.md)
+  - [Multi-node training](./multi-node-training.md)
+- Images
   - [Defining Images](./images.md)
   - [Using existing container images](./existing-images.md)
   - [Named images](./named-images.md)
@@ -15,31 +43,15 @@
   - [Batch processing](./batch-processing.md)
   - [Job queues](./job-queue.md)
   - [Dynamic batching](./dynamic-batching.md)
-  - [Multi-node clusters (Beta)](./multi-node-training.md)
+  - [Multi-node Clusters](./multi-node-clusters.md)
 - Deployment
   - [Apps, Functions, and entrypoints](./apps.md)
   - [Managing deployments](./managing-deployments.md)
-  - [Invoking deployed functions](./trigger-deployed-functions.md)
   - [Continuous deployment](./continuous-deployment.md)
-  - [Running untrusted code in Functions](./restricted-access.md)
-- Modal Endpoints
-  - [Endpoints](./endpoints.md)
-  - [Endpoint metrics](./endpoint-metrics.md)
-  - [Benchmark an endpoint](./endpoint-benchmarks.md)
-  - [Endpoint integrations](./endpoint-integrations.md)
-- Modal Sandboxes
-  - [Sandboxes](./sandboxes.md)
-  - [Running commands](./sandbox-spawn.md)
-  - [Networking and security](./sandbox-networking.md)
-  - [File access](./sandbox-files.md)
-  - [Snapshots](./sandbox-snapshots.md)
-  - [Pricing and resources](./sandbox-resources.md)
-  - [VM Sandboxes (Beta)](./vm-sandboxes.md)
-- Secrets and environment variables
-  - [Secrets](./secrets.md)
-  - [Environment variables](./environment_variables.md)
+  - [Scheduled Functions](./cron.md)
 - HTTP Applications
   - [Servers](./servers.md)
+  - [Sticky Sessions](./sticky-sessions.md)
   - [Web Functions](./webhooks.md)
   - [Streaming endpoints](./streaming-endpoints.md)
   - [Web Function URLs](./webhook-urls.md)
@@ -57,6 +69,9 @@
   - [Dicts](./dicts.md)
   - [Queues](./queues.md)
   - [Dataset ingestion](./dataset-ingestion.md)
+- Secrets and environment variables
+  - [Secrets](./secrets.md)
+  - [Environment variables](./environment_variables.md)
 - Performance
   - [Cold start performance](./cold-start.md)
   - [Memory Snapshots](./memory-snapshots.md)
@@ -69,6 +84,7 @@
   - [Troubleshooting](./troubleshooting.md)
 - Security and privacy
   - [Security and privacy](./security.md)
+  - [Data residency](./data-residency.md)
   - [Customer-supplied encryption keys (Alpha)](./customer-supplied-encryption-keys.md)
   - [Audit logs](./audit-logs.md)
 - Integrations
@@ -76,19 +92,23 @@
   - [Connecting Modal to your Datadog account](./datadog-integration.md)
   - [Connecting Modal to your OpenTelemetry provider](./otel-integration.md)
   - [Okta SSO](./okta-sso.md)
+  - [Microsoft Entra SSO](./entra-sso.md)
   - [Custom SAML SSO](./saml-sso.md)
   - [SCIM Integration (Beta)](./scim.md)
   - [Slack notifications (Beta)](./slack-notifications.md)
 - Workspace & account settings
   - [Workspaces](./workspaces.md)
   - [Environments](./environments.md)
-  - [Modal user account setup](./modal-user-account-setup.md)
   - [Service users](./service-users.md)
+  - [User groups (Beta)](./user-groups.md)
   - [Role-Based Access Control (RBAC)](./rbac.md)
   - [Billing](./billing.md)
+  - [Network egress billing](./network-egress-billing.md)
   - [Budgets](./budgets.md)
 - Other topics
   - [Feature maturity](./feature-maturity.md)
+  - [Notebooks](./notebooks.md)
+  - [Restricted Functions](./restricted-access.md)
   - [JavaScript/Go SDKs (Beta)](./sdk-javascript-go.md)
   - [Modal 1.0 migration guide](./modal-1-0-migration.md)
   - [File and project structure](./project-structure.md)
@@ -97,8 +117,4 @@
   - [Asynchronous API usage](./async.md)
   - [Global variables](./global-variables.md)
   - [Region selection](./region-selection.md)
-  - [Container lifecycle hooks](./lifecycle-functions.md)
-  - [Parametrized functions](./parametrized-functions.md)
-  - [Dynamic function configuration](./dynamic-function-config.md)
-  - [S3 Gateway endpoints](./s3-gateway-endpoints.md)
   - [GPU Metrics](./gpu-metrics.md)

@@ -267,7 +267,7 @@ python app_module.py
 ## local_entrypoint
 
 ```python
-local_entrypoint(self, _warn_parentheses_missing=None, *, name=None)
+local_entrypoint(self, *, name=None)
 ```
 Decorate a function to be used as a CLI entrypoint for a Modal App.
 
@@ -442,13 +442,13 @@ A decorator that registers the wrapped class or partial as a Modal `Cls`.
 ```python
 server(self, *, image=None, env=None, secrets=None, gpu=None, serialized=False,
     volumes={}, cpu=None, memory=None, ephemeral_disk=None,
-    target_concurrency=None, min_containers=None, max_containers=None,
-    buffer_containers=None, scaleup_window=None, scaledown_window=None,
-    startup_timeout=30, name=None, port=8000, unauthenticated=False,
-    h2_enabled=False, exit_grace_period=0, routing_region="us-east",
-    compute_region=None, cloud=None, nonpreemptible=False, proxy=None,
-    i6pn=None, enable_memory_snapshot=False, include_source=None,
-    experimental_options=None)
+    target_concurrency=None, max_concurrency=None, min_containers=None,
+    max_containers=None, buffer_containers=None, scaleup_window=None,
+    scaledown_window=None, startup_timeout=30, name=None, port=8000,
+    unauthenticated=False, h2_enabled=False, exit_grace_period=0,
+    routing_region="us-east", compute_region=None, cloud=None,
+    nonpreemptible=False, proxy=None, i6pn=None, enable_memory_snapshot=False,
+    include_source=None, experimental_options=None)
 ```
 Decorator to register a new Modal Server with this App.
 
@@ -472,6 +472,7 @@ See the [guide](https://modal.com/docs/guide/servers) for more information.
 <Parameter name="memory" type="int | tuple[int, int] | None" defaultValue="None" description="Specify, in MiB, a memory request which is the minimum memory required. Or, pass (request, limit) to additionally specify a hard limit in MiB." />
 <Parameter name="ephemeral_disk" type="int | None" defaultValue="None" description="Specify, in MiB, the ephemeral disk size for the server." />
 <Parameter name="target_concurrency" type="float | None" defaultValue="None" description="Target number of concurrent requests per container; 0 disables autoscaling. May be fractional, e.g. 1.5 to target three concurrent requests per two containers." />
+<Parameter name="max_concurrency" type="int | None" defaultValue="None" description="Maximum number of concurrent requests per container. Requests above this limit receive a 503 response. If set to 0 or unset, request concurrency is unlimited." />
 <Parameter name="min_containers" type="int | None" defaultValue="None" description="Minimum number of containers to keep running regardless of demand." />
 <Parameter name="max_containers" type="int | None" defaultValue="None" description="Limit on the number of containers that can be concurrently running." />
 <Parameter name="buffer_containers" type="int | None" defaultValue="None" description="Extra containers to scale up beyond current demand." />
@@ -681,3 +682,25 @@ app = modal.App.lookup("my-app")
 for entry in app.logs.stream(timeout=60):
     print(entry.message, end="")
 ```
+
+## info
+
+```python
+info(self, refresh=False)
+```
+Return information for a modal `App`.
+
+The information returned includes the App's ID, member functions and servers,
+as well as basic lifecycle information, e.g. who created the app and when.
+
+**Parameters**
+
+<Parameter name="refresh" type="bool" defaultValue="False" description="Whether to fetch the latest info. By default, false, so the info corresponds the App state at the time of the previous lookup." />
+
+**Returns**
+
+`AppInfo` object.
+
+**See Also**
+
+- [`AppInfo`](https://modal.com/docs/sdk/py/latest/types#appinfo)

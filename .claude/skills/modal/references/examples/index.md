@@ -40,6 +40,7 @@
   - [Build a protein-folding dashboard](./esm3.md)
   - [Fold proteins with Boltz-2](./boltz_predict.md)
 - Modal Sandboxes
+  - [Run Cursor Cloud Agents on Modal](./cursor.md)
   - [Run a background coding agent with OpenCode](./opencode_server.md)
   - [Build a scalable AI coding platform](./modal-vibe.md)
   - [Create GIFs from Slack using the Claude Agent SDK](./claude-slack-gif-creator.md)
@@ -49,9 +50,11 @@
   - [Build a stateful, sandboxed code interpreter](./simple_code_interpreter.md)
   - [Run Node.js, Ruby, and more in a Sandbox](./safe_code_execution.md)
   - [Speed up Sandbox starts with warm pools](./sandbox_pool.md)
+  - [Inject secrets into outbound requests](./sandbox_secret_injection.md)
 - Reinforcement Learning
-  - [Train a model to solve math problems using GRPO and verl](./grpo_verl.md)
-  - [Train a model to solve coding problems using GRPO and TRL](./grpo_trl.md)
+  - [Paint flowers with code](./paint_flowers.md)
+  - [Train coding agents](./swe_gym.md)
+  - [Make LLMs better at math](./miles_grpo.md)
 - Embeddings
   - [Serve Liquid AI embeddings with Modal Servers](./liquidai_embeddings_server.md)
   - [Embed millions of documents with TEI](./amazon_embeddings.md)

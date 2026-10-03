@@ -22,7 +22,6 @@ for line in process.stdout:
     print(line, end="")
 
 sb.terminate()
-sb.detach()
 ```
 
 `Sandbox.exec` returns a [`ContainerProcess`](/docs/sdk/py/latest/container_process#containerprocess)
@@ -46,7 +45,6 @@ p.stdin.write_eof()
 p.stdin.drain()
 p.wait()
 sb.terminate()
-sb.detach()
 
 async def run_async():
     sb = await modal.Sandbox.create.aio(app=my_app)
@@ -56,7 +54,6 @@ async def run_async():
     await p.stdin.drain.aio()
     await p.wait.aio()
     await sb.terminate.aio()
-    await sb.detach.aio()
 
 asyncio.run(run_async())
 ```
@@ -75,7 +72,6 @@ sb = modal.Sandbox.create(app=my_app)
 p = sb.exec("echo", "hello")
 print(p.stdout.read())
 sb.terminate()
-sb.detach()
 ```
 
 To stream output, take advantage of the fact that `stdout` and `stderr` are
@@ -93,7 +89,6 @@ for line in p.stdout:
     print(line, end="")
 p.wait()
 sb.terminate()
-sb.detach()
 
 async def run_async():
     sb = await modal.Sandbox.create.aio(app=my_app)
@@ -103,7 +98,6 @@ async def run_async():
         print(line, end="")
     await p.wait.aio()
     await sb.terminate.aio()
-    await sb.detach.aio()
 
 asyncio.run(run_async())
 ```
@@ -152,5 +146,4 @@ p = sb.exec(
 p.wait()
 
 sb.terminate()
-sb.detach()
 ```

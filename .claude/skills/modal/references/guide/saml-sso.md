@@ -6,7 +6,8 @@ Custom SAML SSO is available on the <a href="/pricing">Enterprise plan</a>. Cont
 
 If you use an identity provider (IdP) other than Okta, you can configure custom SAML SSO for your Modal Workspace.
 
-For Okta-specific setup, see our [Okta SSO documentation](/docs/guide/okta-sso).
+For provider-specific setup, see our [Okta SSO documentation](/docs/guide/okta-sso)
+or [Microsoft Entra SSO documentation](/docs/guide/entra-sso).
 
 ## Prerequisites
 
@@ -76,9 +77,3 @@ enabling.
 This URL can be used so that users can sign-in to the correct workspace from your IdP.
 
 `https://modal.com/login/sso?workspace=<workspace>` (replace `<workspace>` with your workspace name)
-
-## Troubleshooting
-
-### Microsoft Entra SAML
-
-Make sure the SAML attributes are mapped correctly. For example, `email` should be lowercase and the SAML attribute should not have a namespace. Read more about Microsoft Entra SAML attributes [here](https://learn.microsoft.com/en-us/entra/identity-platform/saml-claims-customization).

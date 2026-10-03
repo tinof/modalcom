@@ -1,14 +1,19 @@
 # config
 
-Modal intentionally keeps configurability to a minimum.
+Modal client configuration.
 
-The main configuration options are the API tokens: the token id and the token secret.
-These can be configured in two ways:
+Configuration values are read from the active profile in `.modal.toml`. Each
+setting can be overridden by an environment variable named `MODAL_<SETTING>`.
 
-1. By running the `modal token set` command.
-   This writes the tokens to `.modal.toml` file in your home directory.
-2. By setting the environment variables `MODAL_TOKEN_ID` and `MODAL_TOKEN_SECRET`.
-   This takes precedence over the previous method.
+Client processes can authenticate in two ways:
+
+1. Modal API tokens use `MODAL_TOKEN_ID` and `MODAL_TOKEN_SECRET`. The
+   `modal token set` command stores these values in `.modal.toml`.
+2. Third-party OAuth integrations typically inject `MODAL_OAUTH_REFRESH_TOKEN`,
+   `MODAL_OAUTH_CLIENT_ID`, and `MODAL_OAUTH_CLIENT_SECRET` into the process.
+
+The two authentication methods cannot be combined, and all values for the
+selected method must be provided.
 
 .modal.toml
 ---------------
@@ -138,7 +143,7 @@ override_locally(self, key, value)
 ### to_dict
 
 ```python
-to_dict(self)
+to_dict(self, *, include_internal=False)
 ```
 
 ## config_profiles

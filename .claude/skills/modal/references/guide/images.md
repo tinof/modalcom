@@ -25,22 +25,11 @@ For reference documentation on the `modal.Image` object, see
 
 ## What are Images?
 
-Your code on Modal runs in *containers*. Containers are like light-weight
-virtual machines -- container engines use
-[operating system tricks](https://earthly.dev/blog/chroot/) to isolate programs
-from each other ("containing" them), making them work as though they were
-running on their own hardware with their own filesystem. This makes execution
-environments more reproducible, for example by preventing accidental
-cross-contamination of environments on the same machine. For added security,
-Modal runs containers using the sandboxed
-[gVisor container runtime](https://cloud.google.com/blog/products/identity-security/open-sourcing-gvisor-a-sandboxed-container-runtime).
-
-Containers are started up from a stored "snapshot" of their filesystem state
-called an *image*. Producing the image for a container is called *building* the
-image.
+An *image* is a stored "snapshot" of filesystem state that Modal uses to start
+the environment your code runs in. Producing an Image is called *building* it.
 
 By default, Modal Functions and Sandboxes run in a
-[Debian Linux](https://en.wikipedia.org/wiki/Debian) container with a basic
+[Debian Linux](https://en.wikipedia.org/wiki/Debian) environment with a basic
 Python installation of the same minor version `v3.x` as your local Python
 interpreter.
 
@@ -50,6 +39,8 @@ different levels of abstraction and granularity, from high-level convenience
 methods like `pip_install` through wrappers of core container image build
 features like `RUN` and `ENV`. We'll cover each of these in this guide,
 along with tips and tricks for building Images effectively when using each tool.
+
+Note that Image builders run atop Modal's [gVisor runtime](/docs/guide/sandboxes#runtimes).
 
 ## Add Python packages
 

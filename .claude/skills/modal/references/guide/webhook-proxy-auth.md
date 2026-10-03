@@ -73,3 +73,14 @@ This is the same scheme the OpenAI API uses (`Authorization: Bearer <api-key>`),
 ## Environment scoping
 
 On Workspaces with RBAC enabled, tokens are scoped to specific Environments. See the [RBAC guide](/docs/guide/rbac#proxy-tokens) for more information.
+
+## Blocking unauthenticated URLs
+
+Workspace Managers can prevent deployments in an Environment from exposing unauthenticated URLs — Endpoints created with `--unauthenticated`, Servers with `unauthenticated=True`, and Web Functions without `requires_proxy_auth=True`.
+
+The control lives in [Settings → Environments](/settings/workspace-management/environments):
+
+* **Workspace defaults** sets a default that applies to every Environment unless the Environment overrides it.
+* Each Environment can **Inherit** the workspace default, or explicitly **Block** or **Allow** unauthenticated URLs.
+
+When blocking is in effect, `modal deploy`, `modal endpoint create`, or creating an Endpoint through the Dashboard fail if proxy auth is not required.

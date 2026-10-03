@@ -33,7 +33,7 @@ There are two ways to create an additional Modal Workspace on the
 
 <Callout variant="info">
 
-If your Modal account was provisioned through Okta, you will not have the option to create a new Workspace. Your Workspace is managed by your organization's Okta configuration. If you need a new Workspace, contact your organization's Okta administrator.
+If your Modal account was provisioned through SAML SSO, you will not have the option to create a new Workspace. Your Workspace is managed by your organization's identity provider configuration. If you need a new Workspace, contact your organization's identity provider administrator.
 
 </Callout>
 
@@ -43,8 +43,8 @@ If your Modal account was provisioned through Okta, you will not have the option
 
 2. Create from scratch. You can invite anyone to your Workspace.
 
-If you're interested in having a Workspace associated with your Okta
-organization, then check out our [Okta SSO docs](/docs/guide/okta-sso).
+If you're interested in configuring SSO for a Workspace, see our
+[SAML SSO docs](/docs/guide/saml-sso).
 
 To use SSO through Google or other providers, reach out to us at <support@modal.com>.
 

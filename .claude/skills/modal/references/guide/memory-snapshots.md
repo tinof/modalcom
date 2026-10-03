@@ -207,8 +207,8 @@ This happens because Memory Snapshots are specific to the underlying worker type
 
 Snapshot creation may add some latency to Function initialization.
 
-CPU-only Functions need around 6 snapshots for full coverage, and Functions targeting a specific
-GPU (e.g. A100) need 2-3.
+* CPU-only Functions need around 6 snapshots for full coverage.
+* GPU Functions need 2-3 snapshots per GPU type.
 
 ### How do Memory Snapshots handle randomness?
 

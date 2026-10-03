@@ -16,6 +16,15 @@ Modal provides three levels of outbound network restriction:
 
 `outbound_cidr_allowlist` and `outbound_domain_allowlist` can be combined additively - traffic that meets either criteria will be let through.
 
+For advanced HTTPS inspection, the experimental `proxy_traffic_via_sidecar`
+option routes outbound TCP traffic on port 443 from the main container through
+a Sidecar. Relaying replaces the Sandbox's own controls on that traffic rather
+than adding to them: an `outbound_cidr_allowlist` continues to govern every
+other port, but stops applying to port 443, which is instead governed by the
+Sidecar's egress controls. See [Routing HTTPS traffic through a
+Sidecar](/docs/guide/sandbox-sidecars#routing-https-traffic-through-a-sidecar)
+for details.
+
 ### Blocking all network access
 
 Set `block_network=True` to prevent the Sandbox from making any outbound
@@ -143,9 +152,9 @@ sb, err := mc.Sandboxes.Create(ctx, app, image, &modal.SandboxCreateParams{
 
 When a domain allowlist is set:
 
-* **TLS (port 443)** connections are allowed only to the listed domains.
-  Connections to non-allowlisted domains are securely blocked and logged to
-  the Sandbox's system output stream.
+* **TLS (port 443)** connections are allowed only to the listed domains, or to
+  IPs on a CIDR allowlist. Other connections are blocked and logged to the
+  Sandbox's system output stream.
 * **Non-TLS traffic** (HTTP, raw TCP, UDP) to IPs that are not on a CIDR
   allowlist is **blocked**.
 
@@ -155,6 +164,33 @@ Entries prefixed with `*.` match the parent domain and any subdomain:
 | --------------- | ------------------------------------------------- | ----------------- |
 | `example.com`   | `example.com`                                     | `sub.example.com` |
 | `*.example.com` | `example.com`, `a.example.com`, `a.b.example.com` | `evilexample.com` |
+
+#### How domain filtering works
+
+Domains are matched against the
+[SNI](https://en.wikipedia.org/wiki/Server_Name_Indication) in the TLS
+handshake, and Modal resolves that hostname itself rather than trusting the
+destination IP the Sandbox picked. TLS traffic is not decrypted, so the `Host`
+header, URL path, and body are never inspected.
+
+Encrypted Client Hello (ECH) is not supported. Modal only sees the outer public
+name, not the real hostname inside it, so an ECH connection is matched against
+that public name and is blocked unless the public name is on the allowlist.
+
+<Callout variant="warning">
+
+Two domains can share a TLS endpoint, such as two tenants of the same CDN. A
+Sandbox can reach a non-allowlisted domain there by sending an allowlisted SNI
+with the other name in the `Host` header, a technique called *domain fronting*.
+Many providers reject mismatched requests, but the allowlist itself does not
+prevent the mismatch.
+
+If you need protection against domain fronting, consider using a
+[Sidecar](/docs/guide/sandbox-sidecars) as a proxy.
+[This example](/docs/examples/sidecar_traffic_routing) shows how to configure a
+Sidecar as a domain allowlist.
+
+</Callout>
 
 ### Updating the network policy at runtime
 
@@ -347,8 +383,6 @@ url = f"{creds.url}/?_modal_connect_token={creds.token}"
 ws_url = url.replace("https://", "wss://")
 with websockets.connect(ws_url) as socket:
     socket.send("Hello world!")
-
-sb.detach()
 ```
 
 {/snippet}
@@ -372,8 +406,6 @@ const creds = await sb.createConnectToken({
 const response = await fetch(creds.url, {
   headers: { Authorization: `Bearer ${creds.token}` },
 });
-
-sb.detach();
 ```
 
 {/snippet}
@@ -397,8 +429,6 @@ creds, err := sb.CreateConnectToken(ctx, &modal.SandboxCreateConnectTokenParams{
 req, _ := http.NewRequestWithContext(ctx, "GET", creds.URL, nil)
 req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", creds.Token))
 resp, _ := http.DefaultClient.Do(req)
-
-sb.Detach()
 ```
 
 {/snippet} </CodeTabs>
@@ -453,8 +483,6 @@ time.sleep(1)  # Wait for server to start.
 
 print(f"Connecting to {tunnel.url}...")
 print(requests.get(tunnel.url, timeout=5).text)
-
-sb.detach()
 ```
 
 It is also possible to create an encrypted port that uses `HTTP/2` rather than `HTTP/1.1` with the `h2_ports` option. This will return
@@ -475,8 +503,6 @@ p = sb.exec("python", "my_http2_server.py")
 tunnel = sb.tunnels()[port]
 time.sleep(1)
 print(f"Tunnel URL: {tunnel.url}")
-
-sb.detach()
 ```
 
 For more details on how tunnels work, see the [tunnels guide](/docs/guide/tunnels).
@@ -545,12 +571,21 @@ for this sandbox will also use the custom domain.
 
 ## Security model
 
-Sandboxes are built on top of [gVisor](https://gvisor.dev/), a container runtime
-by Google that provides strong isolation properties. gVisor has custom logic to
-prevent Sandboxes from making malicious system calls, giving you stronger isolation
-than most other container runtimes.
+Modal Sandboxes are isolated from the host and from other workloads by one of the two
+[runtimes](/docs/guide/sandboxes#runtimes) we offer:
+
+* **gVisor**: [gVisor](https://gvisor.dev/) is a container runtime developed by Google
+  that implements the Linux system call interface in userspace. System calls from
+  the Sandbox are handled by gVisor instead of the host kernel, giving stronger
+  isolation than normal container runtimes.
+* **VMs**: the Sandbox runs in its own virtual machine with its own Linux
+  kernel, isolated by the CPU's hardware virtualization through the Linux
+  [KVM](https://docs.kernel.org/virt/kvm/index.html) hypervisor.
+
+The [network access controls](#outbound-access-control) on this page apply to
+both runtimes.
 
 Additionally, Sandboxes are not authorized to access other resources in your Modal
 workspace the way that Modal Functions are [by default](/docs/guide/restricted-access).
 As a result, the blast radius of any malicious code will be limited to the Sandbox
-container itself.
+itself.

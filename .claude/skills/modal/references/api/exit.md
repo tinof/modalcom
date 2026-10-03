@@ -1,7 +1,7 @@
 # exit
 
 ```python
-exit(_warn_parentheses_missing=None)
+exit()
 ```
 Decorator for methods which should be executed when a container is about to exit.
 

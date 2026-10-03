@@ -53,21 +53,6 @@ If the issue persists, contact us [in our Slack](https://modal.com/slack).
 We are working on removing these known issues so that writing Modal applications
 in a notebook feels just like developing in regular Python modules and scripts.
 
-## Jupyter inside Modal
-
-You can run Jupyter in Modal using the `modal launch` command. For example:
-
-```
-$ modal launch jupyter --gpu a10g
-```
-
-That will start a Jupyter instance with an A10G GPU attached. You'll be able to
-access the app with via a
-[Modal Tunnel URL](https://modal.com/docs/guide/tunnels). Jupyter
-will stop running whenever you stop Modal call in your terminal.
-
-See `--help` for additional options.
-
 ## Further examples
 
 * [Basic demonstration of running Modal in a notebook](https://github.com/modal-labs/modal-examples/blob/main/11_notebooks/basic.ipynb)

@@ -2,7 +2,7 @@
 
 Modal-specific exception types.
 
-## Notes on `grpclib.GRPCError` migration
+**Notes on `grpclib.GRPCError` migration**
 
 Historically, the Modal SDK could propagate `grpclib.GRPCError` exceptions out
 to user code.  As of v1.3, we are in the process of gracefully migrating to
@@ -42,31 +42,6 @@ class AlreadyExistsError(modal.exception.Error, modal.exception._GRPCErrorWrappe
 
 Raised when a resource creation conflicts with an existing resource.
 
-```python
-__init__(self, message=None)
-```
-
-
-### message
-
-```python
-message(self)
-```
-
-
-### status
-
-```python
-status(self)
-```
-
-
-### details
-
-```python
-details(self)
-```
-
 ## AsyncUsageWarning
 
 
@@ -85,31 +60,6 @@ class AuthError(modal.exception.Error, modal.exception._GRPCErrorWrapper)
 
 Raised when a client has missing or invalid authentication.
 
-```python
-__init__(self, message=None)
-```
-
-
-### message
-
-```python
-message(self)
-```
-
-
-### status
-
-```python
-status(self)
-```
-
-
-### details
-
-```python
-details(self)
-```
-
 ## ClientClosed
 
 
@@ -125,31 +75,6 @@ class ConflictError(modal.exception.InvalidError, modal.exception._GRPCErrorWrap
 ```
 
 Raised when a resource conflict occurs between the request and current system state.
-
-```python
-__init__(self, message=None)
-```
-
-
-### message
-
-```python
-message(self)
-```
-
-
-### status
-
-```python
-status(self)
-```
-
-
-### details
-
-```python
-details(self)
-```
 
 ## ConnectionError
 
@@ -168,31 +93,6 @@ class DataLossError(modal.exception.Error, modal.exception._GRPCErrorWrapper)
 ```
 
 Raised when data is lost or corrupted.
-
-```python
-__init__(self, message=None)
-```
-
-
-### message
-
-```python
-message(self)
-```
-
-
-### status
-
-```python
-status(self)
-```
-
-
-### details
-
-```python
-details(self)
-```
 
 ## DeprecationError
 
@@ -252,15 +152,6 @@ class ExecutionError(modal.exception.Error)
 
 Raised when something unexpected happened during runtime.
 
-## FilesystemExecutionError
-
-
-```python
-class FilesystemExecutionError(modal.exception.Error)
-```
-
-Raised when an unknown error is thrown during a container filesystem operation.
-
 ## FunctionTimeoutError
 
 
@@ -277,11 +168,9 @@ Raised when a Function exceeds its execution duration limit and times out.
 class ImageBuildError(modal.exception.RemoteError)
 ```
 
-Raised when an image build fails.
+Raised when an Image build fails.
 
-```python
-__init__(self, message, image_id)
-```
+Use the `image_id` attribute to reference the failed Image, e.g. to fetch build logs.
 
 ## InputCancellation
 
@@ -305,6 +194,15 @@ class InteractiveTimeoutError(modal.exception.TimeoutError)
 
 Raised when interactive frontends time out while trying to connect to a container.
 
+## InternalAPIWarning
+
+
+```python
+class InternalAPIWarning(UserWarning)
+```
+
+Warning emitted when user code directly accesses Modal's internal gRPC API.
+
 ## InternalError
 
 
@@ -313,31 +211,6 @@ class InternalError(modal.exception.Error, modal.exception._GRPCErrorWrapper)
 ```
 
 Raised when an internal error occurs in the Modal system.
-
-```python
-__init__(self, message=None)
-```
-
-
-### message
-
-```python
-message(self)
-```
-
-
-### status
-
-```python
-status(self)
-```
-
-
-### details
-
-```python
-details(self)
-```
 
 ## InternalFailure
 
@@ -356,31 +229,6 @@ class InvalidError(modal.exception.Error, modal.exception._GRPCErrorWrapper)
 ```
 
 Raised when user does something invalid.
-
-```python
-__init__(self, message=None)
-```
-
-
-### message
-
-```python
-message(self)
-```
-
-
-### status
-
-```python
-status(self)
-```
-
-
-### details
-
-```python
-details(self)
-```
 
 ## LogsFetchError
 
@@ -416,31 +264,6 @@ class NotFoundError(modal.exception.Error, modal.exception._GRPCErrorWrapper)
 
 Raised when a requested resource was not found.
 
-```python
-__init__(self, message=None)
-```
-
-
-### message
-
-```python
-message(self)
-```
-
-
-### status
-
-```python
-status(self)
-```
-
-
-### details
-
-```python
-details(self)
-```
-
 ## OutputExpiredError
 
 
@@ -458,31 +281,6 @@ class PermissionDeniedError(modal.exception.Error, modal.exception._GRPCErrorWra
 ```
 
 Raised when a user does not have permission to perform the requested operation.
-
-```python
-__init__(self, message=None)
-```
-
-
-### message
-
-```python
-message(self)
-```
-
-
-### status
-
-```python
-status(self)
-```
-
-
-### details
-
-```python
-details(self)
-```
 
 ## RemoteError
 
@@ -510,31 +308,6 @@ class ResourceExhaustedError(modal.exception.Error, modal.exception._GRPCErrorWr
 ```
 
 Raised when a server-side resource has been exhausted, e.g. a quota or rate limit.
-
-```python
-__init__(self, message=None)
-```
-
-
-### message
-
-```python
-message(self)
-```
-
-
-### status
-
-```python
-status(self)
-```
-
-
-### details
-
-```python
-details(self)
-```
 
 ## SandboxFilesystemDirectoryNotEmptyError
 
@@ -653,31 +426,6 @@ class ServiceError(modal.exception.Error, modal.exception._GRPCErrorWrapper)
 
 Raised when an error occurs in basic client/server communication.
 
-```python
-__init__(self, message=None)
-```
-
-
-### message
-
-```python
-message(self)
-```
-
-
-### status
-
-```python
-status(self)
-```
-
-
-### details
-
-```python
-details(self)
-```
-
 ## SnapshotCreationError
 
 
@@ -685,7 +433,7 @@ details(self)
 class SnapshotCreationError(modal.exception.Error)
 ```
 
-Raised when a Sandbox fails to create an exit snapshot.
+Snapshot operation is done and failed. Polling again will not produce an Image; filesystem state is gone.
 
 ## TimeoutError
 
@@ -704,31 +452,6 @@ class UnimplementedError(modal.exception.Error, modal.exception._GRPCErrorWrappe
 ```
 
 Raised when a requested operation is not implemented or not supported.
-
-```python
-__init__(self, message=None)
-```
-
-
-### message
-
-```python
-message(self)
-```
-
-
-### status
-
-```python
-status(self)
-```
-
-
-### details
-
-```python
-details(self)
-```
 
 ## VersionError
 

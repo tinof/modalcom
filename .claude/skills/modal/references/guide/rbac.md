@@ -33,29 +33,34 @@ Every Environment has three Environment Roles that determine access to it:
 * **Viewer** — Read-only access to resources in the Environment, including dashboards, logs, metrics, app and function configuration.
 * **No Access** — No read or write access to the Environment.
 
-Workspace Members default to **Contributor**, while service users default to **No Access** and must be granted a Role on each Environment they need. Setting an Environment as **Restricted** makes Members default to **Viewer** instead, and lets you switch specific Members between **Viewer** and **Contributor**.
+Workspace Members default to **Contributor** in regular Environments. In a **Restricted** Environment, Members other than Workspace Owners and Managers use the Environment's default member Role, which can be **Contributor**, **Viewer**, or **No Access**. Workspace Owners and Managers always have **Contributor** access.
 
-## Setting up restricted Environments
+You can assign a **Contributor**, **Viewer**, or **No Access** Role directly to a Workspace Member in a Restricted Environment. A directly assigned Role takes precedence over the default. Service users do not use the member default: they default to **No Access** in every Environment and must be assigned a Role for each Environment they need.
 
-To set up a restricted Environment:
+## Setting up Restricted Environments
 
-1. **Restrict the Environment**: To create a new restricted Environment, use
-   [`modal environment create --restricted NAME`](/docs/cli/latest/environment#modal-environment-create). To restrict an existing unrestricted Environment, navigate to your Workspace's
-   Environment Management page in [Settings](/settings), select the Environment,
-   and click **Make Restricted**.
-2. **Roles apply**: Once restricted, all Workspace Members default to **Viewer**, while Owners and Managers keep **Contributor**.
-3. **Manage access**: Use the **Manage** button next to the Environment to change specific Members between **Viewer** and **Contributor**.
+Create and manage Restricted Environments from [Environment settings](/settings/workspace-management/environments).
+
+You can also create a Restricted Environment with [`modal environment create --restricted NAME`](/docs/cli/latest/environment#modal-environment-create).
+
+Changing the default updates access only for Members who use it. Roles assigned directly to Members and service-user Roles are unchanged.
 
 ### Default access by actor
 
-| Workspace Role               | Unrestricted Environment Default | Restricted Environment Default |
-| ---------------------------- | -------------------------------- | ------------------------------ |
-| Workspace Owner              | Contributor                      | Contributor                    |
-| Workspace Manager            | Contributor                      | Contributor                    |
-| Workspace Member             | Contributor                      | Viewer                         |
-| Service user / service token | No Access                        | No Access                      |
+| Workspace Role               | Unrestricted Environment Default | Restricted with Contributor default | Restricted with Viewer default | Restricted with No Access default |
+| ---------------------------- | -------------------------------- | ----------------------------------- | ------------------------------ | --------------------------------- |
+| Workspace Owner              | Contributor                      | Contributor                         | Contributor                    | Contributor                       |
+| Workspace Manager            | Contributor                      | Contributor                         | Contributor                    | Contributor                       |
+| Workspace Member             | Contributor                      | Contributor                         | Viewer                         | No Access                         |
+| Service user / service token | No Access                        | No Access                           | No Access                      | No Access                         |
 
-Members can only be assigned an Environment Role in restricted Environments, but service users can be given a Role on **any** Environment — restricted or not — from their [tokens settings](/settings/tokens/service-users) or an Environment's roles.
+Workspace Members can only be assigned an Environment Role in Restricted Environments. Service users can be given a Role on **any** Environment — Restricted or not — from their [tokens settings](/settings/tokens/service-users) or an Environment's Roles.
+
+### No Access and Workspace defaults
+
+Environments where a Member has **No Access** are omitted from Environment listings and selectors. Attempts to access the Environment directly are rejected.
+
+A Restricted Environment with a **No Access** default can still be the Workspace's default Environment. Modal does not automatically choose another accessible Environment. Operations that use an inaccessible default fail, so the Member must explicitly select an Environment they can access.
 
 ## Service users and service tokens
 
@@ -101,7 +106,7 @@ If RBAC is disabled on a workspace, scoped tokens fall back to workspace-wide ac
 
 Restricted Environments prevent app and task identities in other Environments from accessing resources inside the restricted Environment. For more detail, see [Cross-Environment Lookups](/docs/guide/environments#cross-environment-lookups).
 
-In practice, this means a task can access objects in its own Environment and other unrestricted Environments, but code running in another Environment cannot use APIs such as `modal.App.lookup()`, `Secret.from_name()`, or `Volume.lookup()` to reach into a restricted Environment.
+In practice, this means a task can access objects in its own Environment and other unrestricted Environments, but code running in another Environment cannot use APIs such as `modal.App.lookup()` or `Secret.from_name()` to reach into a restricted Environment.
 
 This prevents privilege escalation from a less trusted Environment into a more sensitive one.
 
@@ -146,28 +151,28 @@ This setup lets you keep development and testing more open while protecting prod
 
 ## Common access patterns
 
-| Pattern                                                                   | Allowed?                               | Notes                                                                                       |
-| ------------------------------------------------------------------------- | -------------------------------------- | ------------------------------------------------------------------------------------------- |
-| Workspace Member views logs in a restricted Environment                   | Yes                                    | Workspace Members have Viewer access by default in restricted Environments                  |
-| Workspace Member deploys to a restricted Environment                      | No                                     | Contributor access is required to deploy or modify resources                                |
-| Workspace Owner or Manager deploys to a restricted Environment            | Yes                                    | Owners and Managers automatically have Contributor access                                   |
-| Service user deploys to a restricted Environment                          | Yes, if explicitly granted Contributor | Service users have No Access by default and must be assigned Contributor to deploy          |
-| Task running in `dev` reads a secret in restricted `prod`                 | No                                     | Cross-Environment access into a restricted Environment is denied                            |
-| Task running in restricted `prod` accesses objects in unrestricted `test` | Yes                                    | Cross-Environment access is allowed when the target Environment is unrestricted             |
-| User views dashboards or app details in a restricted Environment          | Yes                                    | Viewer access includes read-only views such as dashboards, logs, metrics, and configuration |
-| Task accesses resources in its own Environment                            | Yes                                    | Same-Environment access is unaffected by cross-Environment restrictions                     |
-| Scoped proxy token used on a Web Function in an associated Environment    | Yes                                    | Token must be explicitly associated with the target Environment                             |
-| Scoped proxy token used on a Web Function in a non-associated Environment | No                                     | Token is not valid for Environments it has not been associated with                         |
+| Pattern                                                                   | Allowed?                     | Notes                                                                                       |
+| ------------------------------------------------------------------------- | ---------------------------- | ------------------------------------------------------------------------------------------- |
+| Workspace Member views logs in a Restricted Environment                   | If Viewer or Contributor     | A Member whose effective Role is No Access cannot discover the Environment                  |
+| Workspace Member deploys to a Restricted Environment                      | If Contributor               | Contributor access is required to deploy or modify resources                                |
+| Workspace Owner or Manager deploys to a Restricted Environment            | Yes                          | Owners and Managers automatically have Contributor access                                   |
+| Service user deploys to a Restricted Environment                          | Yes, if assigned Contributor | Service users have No Access by default and must be assigned Contributor to deploy          |
+| Task running in `dev` reads a Secret in Restricted `prod`                 | No                           | Cross-Environment access into a Restricted Environment is denied                            |
+| Task running in Restricted `prod` accesses objects in unrestricted `test` | Yes                          | Cross-Environment access is allowed when the target Environment is unrestricted             |
+| User views dashboards or App details in a Restricted Environment          | If Viewer or Contributor     | Viewer access includes read-only views such as dashboards, logs, metrics, and configuration |
+| Task accesses resources in its own Environment                            | Yes                          | Same-Environment access is unaffected by cross-Environment restrictions                     |
+| Scoped proxy token used on a Web Function in an associated Environment    | Yes                          | Token must be explicitly associated with the target Environment                             |
+| Scoped proxy token used on a Web Function in a non-associated Environment | No                           | Token is not valid for Environments it has not been associated with                         |
 
 ## FAQ
 
 **Can I make Environments completely private?**
 
-No. Workspace Members will always have at least **Viewer** access to restricted Environments. Fully private Environments are planned for the future.
+Yes. Set a Restricted Environment's default member Role to **No Access**, then assign **Viewer** or **Contributor** only to the Workspace Members and service users who need it. Other Members cannot discover the Environment. Workspace Owners and Managers always retain **Contributor** access.
 
 **How do service tokens work with restricted Environments?**
 
-Service tokens authenticate service users. Service users default to **No Access** on every Environment, restricted or not, and cannot read or write to an Environment until you explicitly assign them the **Viewer** or **Contributor** Role. This lets automated systems and CI/CD pipelines deploy and manage production without granting broad Workspace permissions.
+Service tokens authenticate service users. Service users default to **No Access** on every Environment, restricted or not, and cannot read or write to an Environment until you assign them the **Viewer** or **Contributor** Role. This lets automated systems and CI/CD pipelines deploy and manage production without granting broad Workspace permissions.
 
 **Can I use `modal.App.lookup()` across different restricted Environments?**
 
