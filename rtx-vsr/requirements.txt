@@ -1,4 +1,4 @@
 # Local client + deploy tooling only.
 # Runtime deps for the GPU/web containers are pinned in modal_app.py images.
 modal==1.5.4
-requests==2.32.3
+requests==2.33.0
