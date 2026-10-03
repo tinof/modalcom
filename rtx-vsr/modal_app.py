@@ -981,6 +981,14 @@ class UpscaleWorker:
         # deferred until we know we actually need the piped decoder.
         use_nvdec = _nvdec_can_decode(input_path.as_posix())
 
+        # Load this job's VSR effect *before* creating the encoder. When the cached
+        # effect from the previous job had a different output size (an image job, or a
+        # 4K job before an 8K one), CreateEncoder with an explicit level at P5+fullres
+        # failed nvEncInitializeEncoder with error 8 -- every video job after an image
+        # job in production, 2026-10-03. Swapping the effect first avoids that state.
+        sr = self._super_res(quality, plan.sr_width, plan.sr_height)
+        pre = self._preprocess_effect(preprocess, in_width, in_height)
+
         # Equivalent to NVEncC `--qvbr <cq> --preset p5 --tune uhq --tier high --level 5.1
         # --max-bitrate 100000 --multipass 2pass-full --aq --aq-strength N --aq-temporal
         # --bframes 5 --lookahead 32`. Main 10 needs no kwarg: the profile autoselects
@@ -998,16 +1006,34 @@ class UpscaleWorker:
         #     surfaces as error 8 at CreateEncoder.
         #   * `temporalaq` enables on any non-empty string (even "0"); "" left it unset.
         # `aq` is a single key that both enables AQ and sets its strength.
-        encoder = nvc.CreateEncoder(
-            plan.output_width, plan.output_height, "P010", False,
+        encoder_kwargs = dict(
             codec="hevc", preset=NVENC_PRESET.upper(),
             tuning_info={"hq": "high_quality"}.get(NVENC_TUNING, NVENC_TUNING),
             rc="vbr", cq=NVENC_CQ, multipass=NVENC_MULTIPASS, tier="high",
             aq=NVENC_AQ_STRENGTH, temporalaq="1", lookahead="32",
             bf=NVENC_BFRAMES, gop="250",
-            **({"level": level} if (level := _hevc_level(plan.output_width,
-                                                          plan.output_height)) else {}),
         )
+        level = _hevc_level(plan.output_width, plan.output_height)
+        try:
+            encoder = nvc.CreateEncoder(
+                plan.output_width, plan.output_height, "P010", False,
+                **encoder_kwargs, **({"level": level} if level else {}),
+            )
+        except Exception as exc:  # noqa: BLE001 - PyNvVCException is not importable by name
+            # An explicit level at P5+fullres is rejected (error 8) in some warm-container
+            # states -- after a job with a different output size, e.g. 1620p then 4K --
+            # while the same session without a level never failed in any probe
+            # (2026-10-03). Fall back loudly rather than fail the job.
+            if not level or "error 8" not in str(exc):
+                raise
+            print(
+                f"WARNING: NVENC rejected explicit HEVC level {level} (error 8) in this "
+                "container state; retrying with the driver-selected level. The 100 Mbps "
+                "ceiling still applies, but the stream may carry a different level_idc."
+            )
+            encoder = nvc.CreateEncoder(
+                plan.output_width, plan.output_height, "P010", False, **encoder_kwargs,
+            )
         # `cq` makes PyNvVideoCodec zero maxBitRate, and the driver then caps VBR at its
         # own default (~32 Mbps at 5.1), so CQ never reached its target. Restore the
         # ceiling before the first frame -- and before GetSequenceParams() below, since
@@ -1185,8 +1211,6 @@ class UpscaleWorker:
                     yield item
 
         try:
-            sr = self._super_res(quality, plan.sr_width, plan.sr_height)
-            pre = self._preprocess_effect(preprocess, in_width, in_height)
             frames = _decoded_frames()
             while True:
                 decode_start = time.perf_counter()

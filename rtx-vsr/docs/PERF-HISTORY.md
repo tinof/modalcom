@@ -395,3 +395,18 @@ on the 61 s sample: 35.7 fps warm, 78 Mbps, 1526/1526 frames, byte-identical acr
   settings (52 vs 59 fps). At the new defaults the encoder (~36 fps) is far below either
   decode path; the in-process path was not re-measured at those settings.
 
+### Production deploy failure and fix — 2026-10-03 (evening)
+
+The first production deploy of these defaults failed every video job with error 8 at
+`CreateEncoder`; production was restored by redeploying the previous `modal_app.py`
+(rollback is not on the current Modal plan). Cause: every bench sequence had started with a
+video job, while production's first job was an image. Reproduced on the bench: image →
+video failed every time. Bisected on four parallel deploys: without the explicit level, or
+at P4+qres, it passed; tuning and the VBV ceiling were irrelevant. Loading the job's VSR
+effect before `CreateEncoder` fixed image → video; 1620p → 4K still failed intermittently,
+so an error-8 rejection of the explicit level now retries without it (WARNING logged).
+Validation: img/4K ×2, and 16 mixed 4K/8K/1620p jobs in two warm containers: all passed,
+the fallback fired 4 times (those 4K outputs carried level 5.0 or 6.0, same ceiling and
+size). 1620p outputs alternated between two sizes 0.2% apart depending on the preceding
+job; 4K outputs at level 5.1 stayed byte-identical.
+
