@@ -429,6 +429,7 @@ to its own mp4 and joined with ffmpeg's concat demuxer. PyNvVideoCodec 2.2.3, dr
 | Same, 4 sessions at `cpu=12` | 81.1 fps (CPU is not the bound in steady state) |
 | Production, 61 s Blu-ray sample, warm, 4 segments | 55 fps end to end: setup 3 s, encode 73.5 fps, join 4 s |
 | Production, 10-min progressive clip, warm, 24 segments | **75.1-75.5 fps** end to end: setup 8-9 s, encode 82.4-82.9 fps, join 9-10 s |
+| Production, full 46-min H.264 episode (69552 frames, 96 segments), first job in its container | **74.8 fps** end to end: setup 38 s (NGX init 11 s, encoders 26.6 s), encode 81.4 fps, join 37 s; peak RSS 10.0 GiB; 8.05 GB output. Verified in place: 69552 packets and decoded frames, uniform pts, level 153, bt709 x3, all 95 seams and pre-seam frames clean (max Laplacian 12.3), 130 flat frames against the source's own 130 |
 | Unsegmented production path, 61 s sample, warm (same day, for reference) | 34.7-35.7 fps |
 
 UHQ sessions do not scale linearly: each slows to ~26 fps when four run at once (encode
@@ -512,10 +513,22 @@ the sample was identical, across containers and after image, 8K and 1620p jobs. 
 10-minute clip gave 1,587,814,094 bytes three times in one warm container. Compare sizes
 within one warm container, not across containers.
 
+### The unsegmented path is unchanged in output
+
+The 12 s interlace-flagged clip (under the 30 s threshold) gave 120,735,540 bytes twice on
+the new build, and 120,735,540 on the old build's warm run, both on 580 hosts. The GPU-side
+uint8→float conversion, the surface hold and the shared encoder factory therefore change
+nothing. The old build's *first* run gave 120,766,902 bytes, because it hit `NVENC rejected
+explicit HEVC level 5.1` and fell back to the driver-selected level. The new factory
+retries instead.
+
 ### Fixed costs
 
 The first job in a container pays NGX initialisation (~10-14 s with four effects
 loading). After that the pool threads keep their effects (`effects 0.0s`). Each job still
-creates four encoders (3-9 s, depending on how many error-8 retries it hits), and joins
-and remuxes at the end (~4 s for 61 s with a DTS→AAC transcode, ~9 s for 10 min). Below 30 s the unsegmented path is kept, because those fixed costs are not
+creates four encoders (3-9 s, depending on how many error-8 retries it hits; once 26.6 s,
+on the episode run, cause not visible in the logs), and joins and remuxes at the end (~4 s
+for 61 s with a DTS→AAC transcode, ~9 s for 10 min, 37 s for a 46-min episode). Peak RSS
+on that episode was 10.0 GiB. The unsegmented muxer would have held the 8 GB bitstream on
+top of that, and a Blu-ray film at 78 Mbps is ~70 GB. Below 30 s the unsegmented path is kept, because those fixed costs are not
 earned back.

@@ -479,7 +479,9 @@ arguments and nothing else — the app imported cleanly for the entire period wh
    emitting visibly corrupt video. Two cheap checks catch it:
    - **No flat frames.** Decode every frame small (`-vf scale=320:180 -f rawvideo
      -pix_fmt gray`) and count frames whose per-frame standard deviation is > 1. Anything
-     below the full frame count means frames encoded as flat grey.
+     below the full frame count means frames encoded as flat grey. Real content has its
+     own black frames (a 46-min episode had 130), so compare against the source measured
+     the same way (same decoder and scaler), not against zero.
    - **No striping.** Mean absolute Laplacian of a 512px crop from a mid-clip frame,
      extracted with `-pix_fmt rgb24` (without it, ffmpeg writes 16-bit PNGs from the
      10-bit stream). It should land near the source's own value (~1-3 on the reference

@@ -2,6 +2,7 @@ import contextlib
 import dataclasses
 import os
 import queue
+import resource
 import shutil
 import subprocess
 import tempfile
@@ -1871,7 +1872,8 @@ class UpscaleWorker:
             f"decode-wait {100 * stage_seconds['decode-wait'] / worker_seconds:.0f}%, "
             f"infer {100 * stage_seconds['infer'] / worker_seconds:.0f}%, "
             f"encode {100 * stage_seconds['encode'] / worker_seconds:.0f}%; "
-            f"nvdec={'yes' if use_nvdec else 'no'}, batch={batch_limit}, gpu-encoder=yes)"
+            f"nvdec={'yes' if use_nvdec else 'no'}, batch={batch_limit}, gpu-encoder=yes; "
+            f"peak RSS {resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1048576:.1f} GiB)"
         )
         return output_name, "video/mp4"
 
