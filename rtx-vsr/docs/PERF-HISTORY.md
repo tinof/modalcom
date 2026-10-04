@@ -410,3 +410,125 @@ the fallback fired 4 times (those 4K outputs carried level 5.0 or 6.0, same ceil
 size). 1620p outputs alternated between two sizes 0.2% apart depending on the preceding
 job; 4K outputs at level 5.1 stayed byte-identical.
 
+## Four NVENC sessions on keyframe-aligned segments — measured 2026-10-04
+
+The encoder bound above (one P5+fullres+UHQ session, ~38 fps) is per *session*; the card
+has four NVENC engines. Inputs of 30 s or more are now cut at source keyframes into
+segments of up to 30 s, segment *i* goes to session *i mod 4*, and each segment is muxed
+to its own mp4 and joined with ffmpeg's concat demuxer. PyNvVideoCodec 2.2.3, driver
+580.95.05, same quality point. Probe: `scripts/probe_parallel_encode.py`.
+
+### Throughput
+
+| Case | Result |
+|---|---|
+| Encode only, production settings incl. level + ceiling: 1 / 2 / 3 / 4 sessions | 45.1 / 73.6 / 93.0 / 103.9 fps combined |
+| Full per-frame pipeline per thread (VSR, integrity, P010, device sync, Encode), 1 / 2 / 4 threads | 40.0 / 62.8 / 82.8 fps combined |
+| Same, 4 threads with a per-thread CUDA stream sync instead of `torch.cuda.synchronize()` | 98.5 fps, **striped** (Laplacian 52-85, flat frames) |
+| Segmented prototype, 10-min progressive clip (15026 frames, 20 x 30 s), 1 / 4 sessions | 41.7 / 78.9-81.4 fps |
+| Same, 4 sessions at `cpu=12` | 81.1 fps (CPU is not the bound in steady state) |
+| Production, 61 s Blu-ray sample, warm, 4 segments | 55 fps end to end: setup 3 s, encode 73.5 fps, join 4 s |
+| Production, 10-min progressive clip, warm, 24 segments | **75.1-75.5 fps** end to end: setup 8-9 s, encode 82.4-82.9 fps, join 9-10 s |
+| Production, full 46-min H.264 episode (69552 frames, 96 segments), first job in its container | **74.8 fps** end to end: setup 38 s (NGX init 11 s, encoders 26.6 s), encode 81.4 fps, join 37 s; peak RSS 10.0 GiB; 8.05 GB output. Verified in place: 69552 packets and decoded frames, uniform pts, level 153, bt709 x3, all 95 seams and pre-seam frames clean (max Laplacian 12.3), 130 flat frames against the source's own 130 |
+| Unsegmented production path, 61 s sample, warm (same day, for reference) | 34.7-35.7 fps |
+
+UHQ sessions do not scale linearly: each slows to ~26 fps when four run at once (encode
+only), so four engines buy ~2.3x encode-only and ~2x end to end, not 4x. Per-thread
+stream syncs are not an option: nvvfx does not run on the caller's stream.
+
+### Things that had to be true, and were checked
+
+- **Frame-exact partition.** Each segment decodes with input `-ss` one second before its
+  keyframe, `-copyts`, and `trim=start_pts:end_pts` in the stream time base. framemd5 of
+  the concatenated segments equals a sequential decode on mkv, mp4, ts and m2ts remuxes of
+  the interlace-flagged sample (1526/1526), on a full H.264 episode (69552/69552) and on a
+  full HEVC episode (86318/86318). `-ss` is relative to the container's `start_time`:
+  given the absolute pts, MPEG-TS (start 1.56 s) lost 254 of 1526 frames. `trim`'s
+  `end_pts` stops the decode, so a segment does not read to EOF (10 s of a 46-min file:
+  2.5 s). `-enc_time_base:v demux -stats_enc_pre` logs the exact source pts of every
+  delivered frame; production fails the job unless a segment's first frame is its keyframe.
+- **Segment joins.** A continuous session per worker with `FORCEIDR` at each segment
+  start emits packets in segment order; packets are routed to the segment muxer by the
+  session's input index (`m_frameNum`, never reset). Concat output: exact frame count,
+  uniform pts, keyframes exactly at the seams, `ffprobe -count_frames` equal to the
+  source. `EndEncode()` per segment also works but measured 37.4 fps against 44.0 on one
+  worker (the flush idles VSR).
+- **Same parameter sets.** All sessions created with the explicit level emit
+  byte-identical `GetSequenceParams()`, and four sessions encoding the same segments give
+  byte-identical bitstreams. This matters because `FFmpegMuxer` strips the inline
+  VPS/SPS/PPS from IDR packets and the joined file has one hvcC.
+- **Seams are not visible.** The Laplacian spike at segment starts (e.g. 14.8 at frame
+  386) is the source's own keyframes: the unsegmented output reads 18.7 at the same frame.
+
+### Quality: a tie on average, an occasional dip on the seam frame
+
+VMAF 4K v0.6.1 and PSNR-Y against a lossless encode of the same VSR frames (production
+decode, VSR and P010), 61 s sample, 4 segments:
+
+| Output | VMAF mean | 5th pct | min | PSNR-Y |
+|---|---|---|---|---|
+| Unsegmented | 91.253 | 83.03 | 72.86 | 40.888 |
+| Segmented | 91.271 | 83.05 | 72.43 | 40.884 |
+
+On the first frame of each segment (an IDR on a source keyframe) the segmented output
+scored 80.2 / 87.4 / 85.0 against 86.3 / 86.5 / 90.1 unsegmented, a one-frame dip of up to
+~6 at two of three seams. Neighbouring frames went both ways (frame 1129: 89.4 segmented,
+78.9 unsegmented). With 30 s segments that is one such frame per 30 s per session.
+
+### CreateEncoder error 8 is random, not state-dependent
+
+| Series (P5+fullres+UHQ, level 5.1) | Failures |
+|---|---|
+| Fresh container | 3/30 |
+| No level | 0/15 |
+| VSR effect loaded | 5/30 |
+| Three sessions alive | 3/20 |
+
+The next attempt almost always succeeds (one double failure in 80), so the encoder
+factory makes up to six attempts before the no-level fallback. That also removes most of
+the single-session fallbacks seen on 2026-10-03 (4K outputs at level 6.0).
+`CreateEncoder` itself costs ~0.5-0.8 s, so four sessions are ~3 s of setup per job.
+
+### The surface-lifetime race
+
+`Encode()` copies the P010 tensor into the encoder's own buffer with `cuMemcpy2DAsync` on
+a non-blocking stream that PyNvVideoCodec creates, and returns before the copy runs.
+Dropping the tensor right after `Encode()` hands its memory back to torch's allocator,
+which does not know about that stream. With four threads allocating, a later allocation
+can overwrite the surface before the copy reads it. This is a race in the source, not a
+measured failure: the probe once showed one B-frame of 15026 encoded differently between
+two runs (diffuse, max 18 10-bit levels), but those runs were in different containers and
+could have been on hosts with different drivers (next section), so the observation
+cannot be pinned on the race. Both paths now keep the surface alive until the next
+device-wide sync, which waits for every stream. After the fix, four warm runs in one
+container were byte-identical, and so was a run after an image job.
+
+### Run-to-run identity is per host driver
+
+During these runs Modal placed some containers on hosts with driver **610.57.04**. VSR
+still worked (the NGX library is from 580.95.05; `_warn_on_driver_mismatch` fired), but
+the outputs from those hosts differed in size from each other and from the 580 hosts
+(592,119,197 and 592,096,538 against 592,182,118 bytes). On 580 hosts every 4K run of
+the sample was identical, across containers and after image, 8K and 1620p jobs. The
+10-minute clip gave 1,587,814,094 bytes three times in one warm container. Compare sizes
+within one warm container, not across containers.
+
+### The unsegmented path is unchanged in output
+
+The 12 s interlace-flagged clip (under the 30 s threshold) gave 120,735,540 bytes twice on
+the new build, and 120,735,540 on the old build's warm run, both on 580 hosts. The GPU-side
+uint8→float conversion, the surface hold and the shared encoder factory therefore change
+nothing. The old build's *first* run gave 120,766,902 bytes, because it hit `NVENC rejected
+explicit HEVC level 5.1` and fell back to the driver-selected level. The new factory
+retries instead.
+
+### Fixed costs
+
+The first job in a container pays NGX initialisation (~10-14 s with four effects
+loading). After that the pool threads keep their effects (`effects 0.0s`). Each job still
+creates four encoders (3-9 s, depending on how many error-8 retries it hits; once 26.6 s,
+on the episode run, cause not visible in the logs), and joins and remuxes at the end (~4 s
+for 61 s with a DTS→AAC transcode, ~9 s for 10 min, 37 s for a 46-min episode). Peak RSS
+on that episode was 10.0 GiB. The unsegmented muxer would have held the 8 GB bitstream on
+top of that, and a Blu-ray film at 78 Mbps is ~70 GB. Below 30 s the unsegmented path is kept, because those fixed costs are not
+earned back.

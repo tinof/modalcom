@@ -17,7 +17,7 @@ SAMPLE = Path(__file__).parent.parent / "sample" / "jopet_10s.mkv"
 image = (
     modal.Image.debian_slim(python_version="3.12")
     .apt_install("ffmpeg")
-    .uv_pip_install("torch==2.13.0", "PyNvVideoCodec==2.2.0", "numpy==2.5.2")
+    .uv_pip_install("torch==2.13.0", "PyNvVideoCodec==2.2.3", "numpy==2.5.2")
     .add_local_file(SAMPLE.as_posix(), "/sample.mkv", copy=True)
 )
 

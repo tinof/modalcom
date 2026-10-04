@@ -127,17 +127,29 @@ $2.40 at Modal's 2026-10 RTX PRO 6000 rate. On the 61-second Night Manager Blu-r
 CQ 20 produced 78 Mbps, i.e. about 35 GB per hour of grainy 4K. Overlapping VSR with
 encode measured no faster, because the encoder is already busy all the time.
 
-The card has **four NVENC engines** and one session uses one. Independent sessions scale:
-four P5 + HQ sessions measured 210 fps combined, four P6 + UHQ sessions 66 fps. Splitting a
-job into time chunks encoded in parallel is the next speed lever. It is not implemented yet.
-PyNvVideoCodec 2.2.0 exposes no split-frame encoding option, so a single session cannot
-spread one frame over several engines.
+The card has **four NVENC engines** and one session uses one. Since 2026-10-04, videos of
+30 s or more are cut at source keyframes into segments (up to 30 s each), encoded by four
+sessions in parallel, and joined without re-encoding. That runs at about **75 fps** end to
+end on a 10-minute 1080p clip (83 fps in the encode phase) and **55 fps** on the 61-second
+Blu-ray sample, where the fixed per-job costs (creating four encoders, joining) weigh
+more. For long inputs that is about half the GPU time per frame of the single-session
+path; on the 61-second sample, two thirds. Four UHQ sessions do not scale linearly: each
+slows to ~26 fps when all four run. Shorter clips keep the single-session path. The output
+format is unchanged (Main 10, level 5.1, bt709), and mean VMAF against a lossless encode
+is the same (91.27 vs 91.25). Within one warm container the bytes are identical run to
+run. Segmenting also keeps memory bounded on feature-length inputs, which the
+single-session muxer did not. PyNvVideoCodec 2.2.x exposes no split-frame encoding option,
+so a single session cannot spread one frame over several engines.
 
-Each job logs a line like `Video done: 1526 frames in 42.8s = 35.7 fps (decode-wait 1%,
-infer 34%, encode 54%; nvdec=yes, batch=1, gpu-encoder=yes)` (an interlace-flagged
-Blu-ray, hence `nvdec=yes`; progressive input shows `nvdec=in-process`). The `infer` share
-includes time spent waiting for the encoder to accept the next frame. Use it to spot a regression
-or a silent fallback. `nvdec=yes` is expected for interlace-flagged inputs.
+A segmented job logs `Video done: 1526 frames in 27.6s = 55.4 fps (setup 2.8s [effects
+0.0s, encoders 2.7s], encode 20.7s = 73.9 fps, join 4.1s; sessions=4, segments=4; …)`. The
+first job in a container also pays ~10-14 s of NGX initialization in `effects`. A
+single-session job logs a line like `Video done: 1526 frames in 42.8s = 35.7 fps
+(decode-wait 1%, infer 34%, encode 54%; nvdec=yes, batch=1, gpu-encoder=yes)` (an
+interlace-flagged Blu-ray, hence `nvdec=yes`; progressive input shows `nvdec=in-process`).
+The `infer` share includes time spent waiting for the encoder to accept the next frame.
+Use it to spot a regression or a silent fallback. `nvdec=yes` is expected for
+interlace-flagged inputs.
 
 ### Earlier history
 
