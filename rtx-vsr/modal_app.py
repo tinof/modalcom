@@ -1,4 +1,5 @@
 import contextlib
+import dataclasses
 import os
 import queue
 import shutil
@@ -7,6 +8,7 @@ import tempfile
 import threading
 import time
 import uuid
+from concurrent.futures import FIRST_EXCEPTION, ThreadPoolExecutor, wait
 from enum import Enum
 from fractions import Fraction
 from pathlib import Path
@@ -83,6 +85,28 @@ GPU_ENCODER = os.getenv("MODAL_GPU_ENCODER", "1") == "1"
 # architecture completeness rather than throughput. Falls back to the piped decoder for
 # any input NVDEC cannot handle.
 GPU_DECODER = os.getenv("MODAL_GPU_DECODER", "1") == "1"
+# Parallel NVENC sessions for one video. One session at the quality point above is the
+# pipeline's ceiling (~38 fps at 4K), and the RTX PRO 6000 has four NVENC engines that
+# independent sessions use concurrently. Inputs of at least SEGMENTED_MIN_SECONDS are
+# cut at source keyframes into segments of up to SEGMENT_SECONDS; segment i goes to
+# session i mod N, each segment is muxed to its own mp4 on local disk, and ffmpeg's
+# concat demuxer joins them. Measured 2026-10-04 (docs/PERF-HISTORY.md): 4 pipelines
+# 82.8 fps against 40.0 for one, all four streams pixel-clean.
+#
+# Static assignment, not a work queue, keeps the output byte-identical run to run: a
+# session's rate control carries across its segments, so which segments it saw must not
+# depend on scheduling. Segmenting also bounds memory: FFmpegMuxer holds every packet in
+# RAM until Finalize(), which for one muxer per film was ~78 Mbps x duration.
+NVENC_SESSIONS = max(1, int(os.getenv("MODAL_NVENC_SESSIONS", "4")))
+SEGMENT_SECONDS = float(os.getenv("MODAL_SEGMENT_SECONDS", "30"))
+# Shorter inputs keep the unsegmented path: four CreateEncoder calls cost ~3 s, which a
+# short clip does not earn back, and the in-process NVDEC path stays in use for them.
+SEGMENTED_MIN_SECONDS = float(os.getenv("MODAL_SEGMENTED_MIN_SECONDS", "30"))
+# CreateEncoder with an explicit level fails nvEncInitializeEncoder with error 8 at
+# random -- 3/30 on a fresh container, 5/30 with a VSR effect loaded, 3/20 with three
+# sessions alive (2026-10-04) -- and the next attempt almost always succeeds (one double
+# failure in 80). Six attempts leave ~1e-5 before the no-level fallback.
+NVENC_CREATE_ATTEMPTS = 6
 MAX_PIXELS = 1024 * 1024 * 16
 # Frames per inference batch, capped independently of output size.
 #
@@ -175,6 +199,9 @@ gpu_image = (
         "MODAL_GPU_ENCODER": "1" if GPU_ENCODER else "0",
         "MODAL_GPU_DECODER": "1" if GPU_DECODER else "0",
         "MODAL_MAX_BATCH": str(MAX_BATCH or 0),
+        "MODAL_NVENC_SESSIONS": str(NVENC_SESSIONS),
+        "MODAL_SEGMENT_SECONDS": str(SEGMENT_SECONDS),
+        "MODAL_SEGMENTED_MIN_SECONDS": str(SEGMENTED_MIN_SECONDS),
     })
 )
 
@@ -629,8 +656,44 @@ def _probe_decode_hints(input_path: str) -> dict[str, str]:
     return hints
 
 
-def _ffmpeg_decode_command(input_path: str, use_nvdec: bool) -> list[str]:
+def _ffmpeg_decode_command(
+    input_path: str,
+    use_nvdec: bool,
+    segment: "VideoSegment | None" = None,
+    pts_log: str | None = None,
+) -> list[str]:
+    """rawvideo rgb24 decode of the whole input, or of one segment of it.
+
+    A segment seeks to the keyframe at or before its start (input -ss, which is relative
+    to the container's start_time -- with an absolute time MPEG-TS lost 254 of 1526
+    frames), keeps original timestamps (-copyts) and cuts [start_pts, end_pts) with trim,
+    in the stream's own time base. Seeking 1 s early costs one GOP of decode and makes a
+    demuxer that lands late impossible to miss: `pts_log` records the source pts of every
+    delivered frame, and _SegmentDecoder.finish() checks the first one is exactly the
+    segment's start. Verified frame-exact (framemd5 against a full decode) on mkv, mp4,
+    ts and m2ts, interlace-flagged H.264 and progressive H.264.
+    """
     hwaccel = ["-hwaccel", "cuda"] if use_nvdec else []
+    seek: list[str] = []
+    stream_map: list[str] = []
+    trim = ""
+    if segment is not None:
+        # The keyframe scan reads v:0, so the decode must too (ffmpeg's default pick is the
+        # largest video stream, which can be an attached cover image).
+        stream_map = ["-map", "0:v:0"]
+        seek = ["-copyts"]
+        if segment.start_pts is not None:
+            start_seconds = float(segment.start_pts * segment.time_base) - segment.start_time
+            seek_seconds = max(0.0, start_seconds - 1.0)
+            seek += ["-noaccurate_seek", "-ss", f"{seek_seconds:.6f}"]
+        bounds = [f"start_pts={segment.start_pts}"] if segment.start_pts is not None else []
+        bounds += [f"end_pts={segment.end_pts}"] if segment.end_pts is not None else []
+        trim = f"trim={':'.join(bounds)}," if bounds else ""
+    stats: list[str] = []
+    if pts_log is not None:
+        # The rawvideo encoder's own time base is 1/fps; demux keeps the source pts exact.
+        stats = ["-enc_time_base:v", "demux", "-stats_enc_pre", pts_log,
+                 "-stats_enc_pre_fmt", "{pts}"]
     # Untagged streams are the norm on Blu-ray and broadcast HD, and swscale treats an
     # unspecified matrix as BT.601 -- a visible hue shift on HD, since the encode side
     # tags the output bt709. Pick the matrix the way NVDEC's own RGB path does: the
@@ -642,8 +705,8 @@ def _ffmpeg_decode_command(input_path: str, use_nvdec: bool) -> list[str]:
         matrix = "bt709" if height > 576 else "smpte170m"
     in_range = "pc" if hints.get("color_range") == "pc" else "tv"
     return [
-        "ffmpeg", "-hide_banner", "-loglevel", "error", *hwaccel,
-        "-i", input_path, "-an", "-sn", "-dn",
+        "ffmpeg", "-hide_banner", "-loglevel", "error", *hwaccel, *seek,
+        "-i", input_path, *stream_map, "-an", "-sn", "-dn",
         # rawvideo output defaults to CFR, which duplicates frames to fill timestamp gaps
         # (measured 306 frames from a 304-frame Blu-ray cut). Pass frames through 1:1.
         "-fps_mode", "passthrough",
@@ -652,8 +715,9 @@ def _ffmpeg_decode_command(input_path: str, use_nvdec: bool) -> list[str]:
         # and on a neutral grey ramp; exact with the flags: +0.004). accurate_rnd alone
         # does not leave the table path, and NVDEC hands over nv12, where
         # full_chroma_int alone is enough but yuv420p (CPU decode) needs both.
-        "-vf", f"scale=in_color_matrix={matrix}:in_range={in_range}"
+        "-vf", f"{trim}scale=in_color_matrix={matrix}:in_range={in_range}"
                ":flags=bicubic+accurate_rnd+full_chroma_int",
+        *stats,
         "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1",
     ]
 
@@ -669,6 +733,268 @@ def _nvdec_can_decode(input_path: str) -> bool:
         check=False,
     )
     return result.returncode == 0
+
+
+@dataclasses.dataclass(frozen=True)
+class VideoSegment:
+    """[start_pts, end_pts) of the first video stream, in its time base.
+
+    None means unbounded: the first segment has no lower bound and the last none upper,
+    so the segments together yield exactly what a full decode does, including any frames
+    shown before the first keyframe.
+    """
+
+    index: int
+    start_pts: int | None
+    end_pts: int | None
+    time_base: Fraction
+    start_time: float
+
+
+def _plan_segments(input_path: str, sessions: int) -> list[VideoSegment] | None:
+    """Cut points at source keyframes for the parallel encoder, or None to stay unsegmented.
+
+    Aims for a multiple of `sessions` segments of at most SEGMENT_SECONDS each, every cut
+    snapped to the keyframe nearest its ideal position, so static assignment (segment i
+    to session i mod N) gives every session about the same amount of video.
+    """
+    probe = subprocess.run(
+        [
+            "ffprobe", "-v", "error", "-select_streams", "v:0",
+            "-show_entries", "stream=time_base:format=start_time,duration",
+            "-of", "default=noprint_wrappers=1", input_path,
+        ],
+        capture_output=True, text=True, check=False,
+    )
+    fields: dict[str, str] = {}
+    for line in probe.stdout.splitlines():
+        key, _, value = line.partition("=")
+        fields.setdefault(key.strip(), value.strip())
+    try:
+        time_base = Fraction(fields["time_base"])
+        duration = float(fields["duration"])
+    except (KeyError, ValueError, ZeroDivisionError):
+        return None
+    if duration < SEGMENTED_MIN_SECONDS:
+        return None
+    try:
+        start_time = float(fields.get("start_time", "0"))
+    except ValueError:
+        start_time = 0.0
+
+    # Demux only: a packet scan of a two-hour film takes seconds.
+    packets = subprocess.run(
+        [
+            "ffprobe", "-v", "error", "-select_streams", "v:0",
+            "-show_entries", "packet=pts,flags", "-of", "csv=p=0", input_path,
+        ],
+        capture_output=True, text=True, check=False,
+    ).stdout.split()
+    keyframes = []
+    for row in packets:
+        pts, _, flags = row.partition(",")
+        if "K" in flags and pts.lstrip("-").isdigit():
+            keyframes.append(int(pts))
+    keyframes = sorted(set(keyframes))
+
+    def segment(index: int, start: int | None, end: int | None) -> VideoSegment:
+        return VideoSegment(index, start, end, time_base, start_time)
+
+    if len(keyframes) < 2:
+        # Nowhere to cut, but still take the segmented path: it bounds the muxer's memory.
+        return [segment(0, None, None)]
+    count = sessions * max(1, -(-int(duration) // int(max(1.0, sessions * SEGMENT_SECONDS))))
+    first, span = keyframes[0], keyframes[-1] - keyframes[0]
+    cuts: list[int] = []
+    for k in range(1, count):
+        ideal = first + span * k / count
+        nearest = min(keyframes, key=lambda pts: abs(pts - ideal))
+        if nearest > first and (not cuts or nearest > cuts[-1]):
+            cuts.append(nearest)
+    bounds = [None, *cuts, None]
+    return [segment(i, bounds[i], bounds[i + 1]) for i in range(len(bounds) - 1)]
+
+
+class _SegmentDecoder:
+    """One segment's piped ffmpeg decode, read on its own thread into a bounded queue.
+
+    Started one segment ahead of use, so ffmpeg's start-up (0.5 s idle, 2-6 s with eight
+    decoders launching at once on 6 cores) overlaps the previous segment's encode.
+    """
+
+    def __init__(self, input_path: str, use_nvdec: bool, segment: VideoSegment,
+                 frame_bytes: int, scratch_dir: Path) -> None:
+        self.segment = segment
+        self.frame_bytes = frame_bytes
+        self.stop = threading.Event()
+        self.pts_log = scratch_dir / f"segment-{segment.index:05d}.pts"
+        self.log_path = scratch_dir / f"segment-{segment.index:05d}-decode.log"
+        self.log_handle = open(self.log_path, "wb")
+        try:
+            self.proc = subprocess.Popen(
+                _ffmpeg_decode_command(input_path, use_nvdec, segment, self.pts_log.as_posix()),
+                stdout=subprocess.PIPE,
+                stderr=self.log_handle,
+            )
+        except BaseException:
+            self.log_handle.close()
+            raise
+        self.queue: queue.Queue = queue.Queue(maxsize=8)
+        self.reader = threading.Thread(target=self._read, daemon=True)
+        self.reader.start()
+
+    def _read(self) -> None:
+        try:
+            while True:
+                buffer = self.proc.stdout.read(self.frame_bytes)
+                if not buffer or len(buffer) < self.frame_bytes:
+                    break
+                if not _put_until_stopped(self.queue, buffer, self.stop):
+                    return
+        except Exception as exc:  # surfaced on the consuming thread
+            _put_until_stopped(self.queue, exc, self.stop)
+        finally:
+            _put_until_stopped(self.queue, None, self.stop)
+
+    def frames(self):
+        while True:
+            item = self.queue.get()
+            if isinstance(item, Exception):
+                raise RuntimeError(f"Decoding segment {self.segment.index} failed.") from item
+            if item is None:
+                return
+            yield item
+
+    def close(self) -> None:
+        """Release the process and reader, whether the segment finished or not."""
+        with contextlib.suppress(Exception):
+            self.proc.stdout.close()
+        if self.proc.poll() is None:
+            self.proc.kill()
+        _stop_reader(self.reader, self.queue, self.stop)
+        self.proc.wait()
+        self.log_handle.close()
+
+    def finish(self, frame_count: int) -> None:
+        """Fail loudly unless ffmpeg delivered exactly this segment's frames."""
+        return_code = self.proc.wait()
+        self.log_handle.close()
+        tail = self.log_path.read_bytes()[-1500:].decode("utf-8", errors="replace").strip()
+        if return_code != 0:
+            raise RuntimeError(f"ffmpeg decode of segment {self.segment.index} failed: {tail}")
+        pts = [int(value) for value in self.pts_log.read_text().split()]
+        start = self.segment.start_pts
+        problem = None
+        if len(pts) != frame_count:
+            problem = f"logged {len(pts)} frames but delivered {frame_count}"
+        elif frame_count == 0:
+            problem = "no frames decoded"
+        elif start is not None and pts[0] != start:
+            # The seek landed after the segment's keyframe: frames would be lost.
+            problem = f"first frame pts {pts[0]}, expected the keyframe at {start}"
+        elif self.segment.end_pts is not None and max(pts) >= self.segment.end_pts:
+            problem = f"frame pts {max(pts)} is past the segment end {self.segment.end_pts}"
+        if problem:
+            raise RuntimeError(f"Segment {self.segment.index} decode is not frame-exact: {problem}. {tail}")
+
+
+def _nvenc_encoder_kwargs() -> dict[str, str]:
+    # Equivalent to NVEncC `--qvbr <cq> --preset p5 --tune uhq --tier high --level 5.1
+    # --max-bitrate 100000 --multipass 2pass-full --aq --aq-strength N --aq-temporal
+    # --bframes 5 --lookahead 32`. Main 10 needs no kwarg: the profile autoselects
+    # from the P010 input surface. Reference lists are left to the driver (NVEncC's
+    # `MultiRef L0:auto L1:auto`); numrefl0/1 forced 5+5 and measured no faster.
+    #
+    # Two spellings here are load-bearing and were wrong before. PyNvVideoCodec's
+    # option parser drops unknown keys silently (they land in a map<string,string>
+    # with no validation), so a typo costs quality with no error:
+    #   * `qp` is not a key at all. The old `qp="19"` did nothing and this path ran
+    #     plain VBR at the default ~10 Mbps target -- the 2x bitrate gap against the
+    #     piped path. The quality-target key is `cq` (NVENC targetQuality).
+    #   * the tuning value is `uhq`, not `ultra_high_quality`, and HQ is
+    #     `high_quality`, not `hq`; anything else falls through to UNDEFINED, which
+    #     surfaces as error 8 at CreateEncoder.
+    #   * `temporalaq` enables on any non-empty string (even "0"); "" left it unset.
+    # `aq` is a single key that both enables AQ and sets its strength.
+    return dict(
+        codec="hevc", preset=NVENC_PRESET.upper(),
+        tuning_info={"hq": "high_quality"}.get(NVENC_TUNING, NVENC_TUNING),
+        rc="vbr", cq=NVENC_CQ, multipass=NVENC_MULTIPASS, tier="high",
+        aq=NVENC_AQ_STRENGTH, temporalaq="1", lookahead="32",
+        bf=NVENC_BFRAMES, gop="250",
+    )
+
+
+def _create_hevc_encoders(count: int, width: int, height: int) -> list:
+    """Up to `count` identically configured NVENC sessions, ceiling restored, same SPS.
+
+    Every session of one job must emit byte-identical parameter sets: FFmpegMuxer strips
+    the inline VPS/SPS/PPS from IDR packets (the hvcC box carries them), and the joined
+    file has one hvcC, so a segment encoded under different parameters would be decoded
+    against the wrong ones. Probed 2026-10-04: at the explicit level all sessions match.
+    Returns fewer sessions (with a WARNING) only if a no-level fallback cannot match.
+    """
+    import PyNvVideoCodec as nvc
+
+    kwargs = _nvenc_encoder_kwargs()
+
+    def create(level: str | None):
+        for attempt in range(1, NVENC_CREATE_ATTEMPTS + 1):
+            try:
+                encoder = nvc.CreateEncoder(
+                    width, height, "P010", False, **kwargs, **({"level": level} if level else {}),
+                )
+                break
+            except Exception as exc:  # noqa: BLE001 - PyNvVCException is not importable by name
+                if "error 8" not in str(exc) or attempt == NVENC_CREATE_ATTEMPTS:
+                    raise
+                print(f"NVENC CreateEncoder returned error 8 (intermittent), attempt {attempt} "
+                      f"of {NVENC_CREATE_ATTEMPTS}; retrying.")
+        # `cq` makes PyNvVideoCodec zero maxBitRate, and the driver then caps VBR at its
+        # own default (~32 Mbps at 5.1), so CQ never reached its target. Restore the
+        # ceiling before the first frame -- and before GetSequenceParams(), since the
+        # HRD values land in the VPS/SPS the muxer stores as extradata.
+        if NVENC_MAX_MBPS > 0:
+            rc = encoder.GetEncodeReconfigureParams()
+            rc.maxBitRate = NVENC_MAX_MBPS * 1_000_000
+            rc.vbvBufferSize = NVENC_MAX_MBPS * 1_000_000
+            if not encoder.Reconfigure(rc):
+                raise RuntimeError("NVENC Reconfigure() refused the bitrate ceiling.")
+        return encoder
+
+    level = _hevc_level(width, height)
+    try:
+        encoders = [create(level) for _ in range(count)]
+    except Exception as exc:  # noqa: BLE001
+        if not level or "error 8" not in str(exc):
+            raise
+        # An explicit level at P5+fullres is rejected (error 8) at random; six straight
+        # rejections have not been observed. Fall back loudly rather than fail the job.
+        print(
+            f"WARNING: NVENC rejected explicit HEVC level {level} (error 8) "
+            f"{NVENC_CREATE_ATTEMPTS} times in a row; using the driver-selected level. "
+            "The ceiling still applies, but the stream may carry a different level_idc."
+        )
+        level = None
+        encoders = [create(None) for _ in range(count)]
+
+    reference = bytes(encoders[0].GetSequenceParams())
+    matched = [encoders[0]]
+    for encoder in encoders[1:]:
+        for attempt in range(1, NVENC_CREATE_ATTEMPTS + 1):
+            if bytes(encoder.GetSequenceParams()) == reference:
+                matched.append(encoder)
+                break
+            # Without an explicit level the driver picks one per session (5.0 or 6.0
+            # for the same input), so a session can disagree with the first.
+            if attempt < NVENC_CREATE_ATTEMPTS:
+                encoder = create(level)
+    if len(matched) < count:
+        print(
+            f"WARNING: only {len(matched)} of {count} NVENC sessions produced matching "
+            "parameter sets; encoding with fewer sessions (slower, same output format)."
+        )
+    return matched
 
 
 def _warn_on_driver_mismatch() -> None:
@@ -696,7 +1022,9 @@ def _is_video(input_name: str, mime_type: str | None) -> bool:
 @app.cls(
     image=gpu_image,
     gpu=GPU_TYPE,
-    timeout=3600,
+    # A feature film at ~80 fps is ~40 min of encoding; 3 h leaves room for long inputs
+    # and the slower unsegmented fallbacks.
+    timeout=3 * 3600,
     # NVDEC and NVENC both hand frames back through CPU-side swscale conversions
     # (nv12->rgb24 in, rgb24->p010 out) that run concurrently with inference. Those
     # conversions once capped 4K throughput at 4 cores, but that was before NVDEC decode
@@ -761,9 +1089,19 @@ class UpscaleWorker:
         # Serializes Volume reload/commit across concurrent inputs (see run()).
         self._volume_lock = threading.Lock()
         self._active_jobs = 0
+        # Worker threads of the parallel encoder. Persistent, so each keeps its VSR
+        # effect in the per-thread cache above from one job to the next.
+        self._segment_pool = ThreadPoolExecutor(
+            max_workers=NVENC_SESSIONS, thread_name_prefix="nvenc-session"
+        )
+        # One segmented job at a time per container: two jobs interleaving their
+        # submissions could each hold part of the pool while waiting for the rest (a
+        # deadlock until the timeout), and they would compete for the same four engines.
+        self._segment_job_lock = threading.Lock()
 
     @modal.exit()
     def teardown(self) -> None:
+        self._segment_pool.shutdown(wait=True, cancel_futures=True)
         self._close_sr()
 
     def _close_sr(self) -> None:
@@ -838,8 +1176,17 @@ class UpscaleWorker:
                 .contiguous()
             )
         else:
-            frame_tensor = torch.from_numpy(np.stack(rgb_frames, axis=0)).float().div(255.0)
-            batch_cuda = frame_tensor.cuda().permute(0, 3, 1, 2).contiguous()
+            # Upload uint8 and convert on the GPU: the float conversion used to run on the
+            # CPU and push 4x the bytes over PCIe. float32 x/255 is correctly rounded on
+            # both, so the values are identical.
+            batch_cuda = (
+                torch.from_numpy(np.stack(rgb_frames, axis=0))
+                .cuda()
+                .permute(0, 3, 1, 2)
+                .float()
+                .div(255.0)
+                .contiguous()
+            )
 
         if plan.is_hybrid and not getattr(self, "_logged_hybrid", False):
             print(
@@ -989,61 +1336,9 @@ class UpscaleWorker:
         sr = self._super_res(quality, plan.sr_width, plan.sr_height)
         pre = self._preprocess_effect(preprocess, in_width, in_height)
 
-        # Equivalent to NVEncC `--qvbr <cq> --preset p5 --tune uhq --tier high --level 5.1
-        # --max-bitrate 100000 --multipass 2pass-full --aq --aq-strength N --aq-temporal
-        # --bframes 5 --lookahead 32`. Main 10 needs no kwarg: the profile autoselects
-        # from the P010 input surface. Reference lists are left to the driver (NVEncC's
-        # `MultiRef L0:auto L1:auto`); numrefl0/1 forced 5+5 and measured no faster.
-        #
-        # Two spellings here are load-bearing and were wrong before. PyNvVideoCodec's
-        # option parser drops unknown keys silently (they land in a map<string,string>
-        # with no validation), so a typo costs quality with no error:
-        #   * `qp` is not a key at all. The old `qp="19"` did nothing and this path ran
-        #     plain VBR at the default ~10 Mbps target -- the 2x bitrate gap against the
-        #     piped path. The quality-target key is `cq` (NVENC targetQuality).
-        #   * the tuning value is `uhq`, not `ultra_high_quality`, and HQ is
-        #     `high_quality`, not `hq`; anything else falls through to UNDEFINED, which
-        #     surfaces as error 8 at CreateEncoder.
-        #   * `temporalaq` enables on any non-empty string (even "0"); "" left it unset.
-        # `aq` is a single key that both enables AQ and sets its strength.
-        encoder_kwargs = dict(
-            codec="hevc", preset=NVENC_PRESET.upper(),
-            tuning_info={"hq": "high_quality"}.get(NVENC_TUNING, NVENC_TUNING),
-            rc="vbr", cq=NVENC_CQ, multipass=NVENC_MULTIPASS, tier="high",
-            aq=NVENC_AQ_STRENGTH, temporalaq="1", lookahead="32",
-            bf=NVENC_BFRAMES, gop="250",
-        )
-        level = _hevc_level(plan.output_width, plan.output_height)
-        try:
-            encoder = nvc.CreateEncoder(
-                plan.output_width, plan.output_height, "P010", False,
-                **encoder_kwargs, **({"level": level} if level else {}),
-            )
-        except Exception as exc:  # noqa: BLE001 - PyNvVCException is not importable by name
-            # An explicit level at P5+fullres is rejected (error 8) in some warm-container
-            # states -- after a job with a different output size, e.g. 1620p then 4K --
-            # while the same session without a level never failed in any probe
-            # (2026-10-03). Fall back loudly rather than fail the job.
-            if not level or "error 8" not in str(exc):
-                raise
-            print(
-                f"WARNING: NVENC rejected explicit HEVC level {level} (error 8) in this "
-                "container state; retrying with the driver-selected level. The 100 Mbps "
-                "ceiling still applies, but the stream may carry a different level_idc."
-            )
-            encoder = nvc.CreateEncoder(
-                plan.output_width, plan.output_height, "P010", False, **encoder_kwargs,
-            )
-        # `cq` makes PyNvVideoCodec zero maxBitRate, and the driver then caps VBR at its
-        # own default (~32 Mbps at 5.1), so CQ never reached its target. Restore the
-        # ceiling before the first frame -- and before GetSequenceParams() below, since
-        # the HRD values land in the VPS/SPS the muxer stores as extradata.
-        if NVENC_MAX_MBPS > 0:
-            rc = encoder.GetEncodeReconfigureParams()
-            rc.maxBitRate = NVENC_MAX_MBPS * 1_000_000
-            rc.vbvBufferSize = NVENC_MAX_MBPS * 1_000_000
-            if not encoder.Reconfigure(rc):
-                raise RuntimeError("NVENC Reconfigure() refused the bitrate ceiling.")
+        # Settings, level policy, error-8 retries and the bitrate ceiling all live in the
+        # shared factory, so this path and the parallel one cannot drift apart.
+        encoder = _create_hevc_encoders(1, plan.output_width, plan.output_height)[0]
         fps_num, fps_den = Fraction(fps).limit_denominator(65535).as_integer_ratio()
         muxer = nvc.FFmpegMuxer(
             video_only_path.as_posix(), nvc.MP4, "hevc",
@@ -1169,6 +1464,8 @@ class UpscaleWorker:
                 count += 1
             return count
 
+        held_surface: list = [None]  # last P010 surface handed to Encode(), see _flush
+
         def _flush(sr, pre) -> None:
             nonlocal infer_seconds, encode_seconds, packet_count
             if not rgb_batch:
@@ -1191,7 +1488,16 @@ class UpscaleWorker:
                 # buffer alive instead does NOT work (variants K/L/M) -- the race is
                 # against the kernels filling it, not against the allocator.
                 torch.cuda.synchronize()
+                # Encode() copies the surface into the encoder's own buffer with
+                # cuMemcpy2DAsync on a non-blocking stream PyNvVideoCodec creates, and
+                # returns before that copy runs. Dropping `p010` at once would hand its
+                # memory back to torch's allocator, which knows nothing of that stream:
+                # the next allocation could overwrite the surface before NVENC got it.
+                # The device-wide sync above also waits for the previous frame's copy,
+                # so the previous surface is safe to release only now.
+                held_surface[0] = None
                 packet_count += _mux(encoder.Encode(p010))
+                held_surface[0] = p010
             encode_seconds += time.perf_counter() - encode_start
             rgb_batch.clear()
 
@@ -1234,6 +1540,8 @@ class UpscaleWorker:
                 decode_log_handle.close()
 
         packet_count += _mux(encoder.EndEncode())
+        torch.cuda.synchronize()
+        held_surface[0] = None
         muxer.Finalize()
         # Drop the reference so the container file is closed before ffmpeg reads it.
         muxer = None
@@ -1281,6 +1589,292 @@ class UpscaleWorker:
         )
         return output_name, "video/mp4"
 
+    def _upscale_video_segmented(
+        self,
+        input_path: Path,
+        output_dir: Path,
+        stem: str,
+        segments: list[VideoSegment],
+        resize_type: str,
+        scale: float,
+        width: int,
+        height: int,
+        quality: str,
+        keep_aspect_ratio: bool = True,
+        preprocess: str | None = None,
+        scratch_dir: Path | None = None,
+    ) -> tuple[str, str]:
+        """Parallel NVENC sessions over keyframe-aligned segments (see NVENC_SESSIONS).
+
+        Each worker thread owns one VSR effect (the per-thread `_super_res` cache), one
+        encoder session and its share of the segments: i, i+N, i+2N, ... in time order.
+        Per segment it runs a piped ffmpeg decode (seek + trim, prefetched one segment
+        ahead), VSR, P010 and Encode -- the same per-frame steps, sync included, as
+        _upscale_video_gpu -- and muxes into the segment's own mp4. One session runs
+        continuously across its segments: FORCEIDR starts each segment, and packets are
+        routed to segment muxers by the session's input index. EndEncode() runs once,
+        after the worker's last segment; flushing per segment measured 37.4 fps against
+        44.0 on one worker (2026-10-04).
+        """
+        import numpy as np
+        import PyNvVideoCodec as nvc
+        import torch
+
+        if not getattr(UpscaleWorker, "_dlpack_patched", False):
+            original_dlpack = torch.Tensor.__dlpack__
+            torch.Tensor.__dlpack__ = lambda self, *a, **k: original_dlpack(self)
+            UpscaleWorker._dlpack_patched = True
+
+        output_name = f"{stem}_upscaled.mp4"
+        output_path = output_dir / output_name
+        scratch_dir = Path(tempfile.mkdtemp(prefix="segments-", dir=scratch_dir))
+
+        in_width, in_height, fps = _probe_video_metadata(input_path.as_posix())
+        plan = plan_dimensions(
+            input_width=in_width,
+            input_height=in_height,
+            resize_type=resize_type,
+            scale=scale,
+            width=width,
+            height=height,
+            keep_aspect_ratio=keep_aspect_ratio,
+        )
+        batch_limit = _batch_size_for_output(plan.output_width, plan.output_height)
+        frame_bytes = in_width * in_height * 3
+        use_nvdec = _nvdec_can_decode(input_path.as_posix())
+        if not use_nvdec:
+            print(
+                "WARNING: NVDEC cannot decode this input (unsupported codec or pixel "
+                "format); falling back to CPU decoding, which is slower."
+            )
+        fps_num, fps_den = Fraction(fps).limit_denominator(65535).as_integer_ratio()
+        pts_increment = round(90000 * fps_den / fps_num)
+        force_idr = int(nvc.NV_ENC_PIC_FLAGS.FORCEIDR)
+
+        sessions = min(NVENC_SESSIONS, len(segments))
+        stop = threading.Event()
+        loaded = [threading.Event() for _ in range(sessions)]
+        go = threading.Event()
+        encoders: list = []
+        segment_frames = [0] * len(segments)
+        segment_paths = [scratch_dir / f"segment-{seg.index:05d}.mp4" for seg in segments]
+        stage_seconds = {"decode-wait": 0.0, "infer": 0.0, "encode": 0.0}
+        effect_seconds = [0.0] * sessions
+        stage_lock = threading.Lock()
+
+        def worker(slot: int) -> None:
+            decode_wait = infer_seconds = encode_seconds = 0.0
+            decoders: list[_SegmentDecoder] = []
+            try:
+                # Per-thread effects, loaded before any encoder exists (the error-8
+                # mitigation of _upscale_video_gpu, kept for the same reason).
+                effect_start = time.perf_counter()
+                sr = self._super_res(quality, plan.sr_width, plan.sr_height)
+                pre = self._preprocess_effect(preprocess, in_width, in_height)
+                with stage_lock:
+                    effect_seconds[slot] = time.perf_counter() - effect_start
+                # The first segment is this slot's whatever the session count turns out
+                # to be (segments[slot::k][0] == segments[slot]), so its ffmpeg start-up
+                # can overlap encoder creation.
+                first = _SegmentDecoder(
+                    input_path.as_posix(), use_nvdec, segments[slot], frame_bytes, scratch_dir,
+                )
+                decoders.append(first)
+                loaded[slot].set()
+                go.wait()
+                if stop.is_set() or slot >= len(encoders):
+                    return
+                encoder = encoders[slot]
+                mine = segments[slot::len(encoders)]
+                # [segment, first session input index, frame count or None, muxer, packets]
+                open_segments: list[list] = []
+                session_frames = 0
+
+                def route(packets) -> None:
+                    for packet in packets or []:
+                        index = packet["timestamp"]
+                        entry = next(
+                            (e for e in open_segments
+                             if index >= e[1] and (e[2] is None or index < e[1] + e[2])),
+                            None,
+                        )
+                        if entry is None:
+                            raise RuntimeError(f"NVENC returned a packet for unknown input {index}.")
+                        entry[3].MuxVideoPacket(
+                            bytes(packet["data"]), packet["picture_type"], index - entry[1]
+                        )
+                        entry[4] += 1
+                        if entry[2] is not None and entry[4] == entry[2]:
+                            entry[3].Finalize()
+                            open_segments.remove(entry)
+
+                def start(position: int) -> _SegmentDecoder | None:
+                    if position >= len(mine):
+                        return None
+                    decoder = _SegmentDecoder(
+                        input_path.as_posix(), use_nvdec, mine[position], frame_bytes, scratch_dir,
+                    )
+                    decoders.append(decoder)
+                    return decoder
+
+                held: list = [None]  # last P010 surface handed to Encode()
+                current = first
+                for position, segment in enumerate(mine):
+                    following = start(position + 1)  # prefetch: overlaps ffmpeg start-up
+                    muxer = nvc.FFmpegMuxer(
+                        segment_paths[segment.index].as_posix(), nvc.MP4, "hevc",
+                        plan.output_width, plan.output_height, fps_num, fps_den,
+                        1, 90000, encoder.GetSequenceParams(),
+                    )
+                    # See _upscale_video_gpu: Finalize() rebuilds display-order PTS.
+                    muxer.SetUniformPtsIncrement(pts_increment)
+                    entry = [segment, session_frames, None, muxer, 0]
+                    open_segments.append(entry)
+                    frame_count = 0
+                    batch: list = []
+
+                    def flush() -> None:
+                        nonlocal infer_seconds, encode_seconds, frame_count
+                        if not batch:
+                            return
+                        infer_start = time.perf_counter()
+                        upscaled = self._upscale_rgb_batch(sr, batch, plan, pre, keep_on_gpu=True)
+                        infer_seconds += time.perf_counter() - infer_start
+                        encode_start = time.perf_counter()
+                        for frame_rgb in upscaled:
+                            p010 = _rgb_to_p010(frame_rgb)
+                            # The striping fix (see _upscale_video_gpu). A per-thread stream
+                            # sync is NOT enough: measured striped (Laplacian 52-85) with
+                            # four workers, because nvvfx does not run on our stream.
+                            torch.cuda.synchronize()
+                            held[0] = None  # see _upscale_video_gpu: the copy is done now
+                            route(encoder.Encode(p010, force_idr) if frame_count == 0
+                                  else encoder.Encode(p010))
+                            held[0] = p010
+                            frame_count += 1
+                        encode_seconds += time.perf_counter() - encode_start
+                        batch.clear()
+
+                    frames = current.frames()
+                    while not stop.is_set():
+                        wait_start = time.perf_counter()
+                        buffer = next(frames, None)
+                        decode_wait += time.perf_counter() - wait_start
+                        if buffer is None:
+                            break
+                        batch.append(
+                            np.frombuffer(buffer, dtype=np.uint8).reshape(in_height, in_width, 3)
+                        )
+                        if len(batch) >= batch_limit:
+                            flush()
+                    if stop.is_set():
+                        return
+                    flush()
+                    current.finish(frame_count)
+                    entry[2] = frame_count
+                    session_frames += frame_count
+                    segment_frames[segment.index] = frame_count
+                    if entry[4] == frame_count:
+                        muxer.Finalize()
+                        open_segments.remove(entry)
+                    current = following
+                encode_start = time.perf_counter()
+                route(encoder.EndEncode())
+                torch.cuda.synchronize()
+                held[0] = None
+                encode_seconds += time.perf_counter() - encode_start
+                if open_segments:
+                    missing = [(e[0].index, e[2], e[4]) for e in open_segments]
+                    raise RuntimeError(
+                        f"Encoder returned too few packets (segment, frames, packets): {missing}"
+                    )
+            except BaseException:
+                stop.set()
+                raise
+            finally:
+                loaded[slot].set()
+                for decoder in decoders:
+                    decoder.close()
+                with stage_lock:
+                    stage_seconds["decode-wait"] += decode_wait
+                    stage_seconds["infer"] += infer_seconds
+                    stage_seconds["encode"] += encode_seconds
+
+        print(
+            f"Segmented encode: {len(segments)} keyframe-aligned segments across {sessions} "
+            "NVENC sessions; decoding through ffmpeg"
+            f"{' NVDEC' if use_nvdec else ''} (woven, seek + trim per segment)."
+        )
+        with self._segment_job_lock:
+            started = time.perf_counter()
+            futures = [self._segment_pool.submit(worker, slot) for slot in range(sessions)]
+            try:
+                for event in loaded:
+                    while not event.wait(timeout=0.5):
+                        if any(f.done() for f in futures):
+                            break
+                effects_done = time.perf_counter()
+                if not stop.is_set():
+                    encoders.extend(
+                        _create_hevc_encoders(sessions, plan.output_width, plan.output_height)
+                    )
+                setup_done = time.perf_counter()
+            except BaseException:
+                stop.set()
+                raise
+            finally:
+                go.set()
+                done, _ = wait(futures, return_when=FIRST_EXCEPTION)
+                if any(f.exception() for f in done):
+                    stop.set()
+                wait(futures)
+                encoders.clear()
+            for future in futures:
+                if future.exception() is not None:
+                    raise future.exception()
+            encode_done = time.perf_counter()
+
+        frame_count = sum(segment_frames)
+        if frame_count == 0:
+            raise ValueError("Uploaded video has no decodable frames.")
+        list_path = scratch_dir / "segments.txt"
+        list_path.write_text(
+            "".join(f"file '{path.as_posix()}'\n" for path in segment_paths if path.exists())
+        )
+        # Joins the segments without re-encoding, then the same remux as
+        # _upscale_video_gpu: audio from the source and the bt709 VUI.
+        mux_command = [
+            "ffmpeg", "-y", "-loglevel", "error",
+            "-f", "concat", "-safe", "0", "-i", list_path.as_posix(),
+            "-i", input_path.as_posix(),
+            "-map", "0:v:0", *_audio_args(input_path.as_posix()),
+            "-c:v", "copy",
+            "-bsf:v", "hevc_metadata=colour_primaries=1:transfer_characteristics=1"
+                      ":matrix_coefficients=1:video_full_range_flag=0",
+            "-movflags", "+faststart", output_path.as_posix(),
+        ]
+        result = subprocess.run(mux_command, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise RuntimeError(f"Muxing failed: {result.stderr.strip()[-1500:]}")
+        shutil.rmtree(scratch_dir, ignore_errors=True)
+
+        finished = time.perf_counter()
+        elapsed = max(finished - started, 1e-6)
+        encode_wall = max(encode_done - setup_done, 1e-6)
+        worker_seconds = max(encode_wall * sessions, 1e-6)
+        print(
+            f"Video done: {frame_count} frames in {elapsed:.1f}s = {frame_count / elapsed:.1f} fps "
+            f"(setup {setup_done - started:.1f}s [effects {max(effect_seconds):.1f}s, encoders "
+            f"{setup_done - effects_done:.1f}s], encode {encode_wall:.1f}s = "
+            f"{frame_count / encode_wall:.1f} fps, join {finished - encode_done:.1f}s; "
+            f"sessions={sessions}, segments={len(segments)}; summed over sessions: "
+            f"decode-wait {100 * stage_seconds['decode-wait'] / worker_seconds:.0f}%, "
+            f"infer {100 * stage_seconds['infer'] / worker_seconds:.0f}%, "
+            f"encode {100 * stage_seconds['encode'] / worker_seconds:.0f}%; "
+            f"nvdec={'yes' if use_nvdec else 'no'}, batch={batch_limit}, gpu-encoder=yes)"
+        )
+        return output_name, "video/mp4"
+
     def _upscale_video(
         self,
         input_path: Path,
@@ -1298,6 +1892,12 @@ class UpscaleWorker:
         import numpy as np
 
         if GPU_ENCODER and self.encoder == "hevc_nvenc":
+            segments = _plan_segments(input_path.as_posix(), NVENC_SESSIONS)
+            if segments is not None:
+                return self._upscale_video_segmented(
+                    input_path, output_dir, stem, segments, resize_type, scale, width,
+                    height, quality, keep_aspect_ratio, preprocess, scratch_dir,
+                )
             return self._upscale_video_gpu(
                 input_path, output_dir, stem, resize_type, scale, width, height,
                 quality, keep_aspect_ratio, preprocess, scratch_dir,

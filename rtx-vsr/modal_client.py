@@ -93,7 +93,7 @@ def run() -> None:
         default=True,
         help="Stretch to exact target dimensions instead of preserving aspect ratio inside the box",
     )
-    parser.add_argument("--timeout", type=int, default=3600, help="Max seconds to wait for the job to finish")
+    parser.add_argument("--timeout", type=int, default=3 * 3600, help="Max seconds to wait for the job to finish")
     parser.add_argument("--poll-interval", type=float, default=5.0, help="Seconds between result polls")
     args = parser.parse_args()
 

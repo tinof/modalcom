@@ -177,6 +177,7 @@ half is a mean abs diff between consecutive frames in a static region.
 | `verify_roundtrip.py` | Running the deployed worker on a Volume-staged job, warm, without proxy tokens. `MODAL_APP_NAME` selects a bench deploy. |
 | `probe_nvdec_interlace.py` | Re-testing whether in-process NVDEC still deinterlaces interlace-flagged PsF input (row-parity diff against ffmpeg's woven decode). |
 | `probe_stages.py` | Per-stage timing: VSR alone, encode alone per preset, serial vs overlapped, N concurrent NVENC sessions. One encoder per single-use container. |
+| `probe_parallel_encode.py` | Several NVENC sessions in one process: encode-only scaling, per-thread pipelines (and their pixels), segment joins, CreateEncoder error-8 rates, and a segmented prototype on a staged clip. |
 | `probe_encoder_quality.py` | Encoder settings vs quality: same VSR frames, one encoder per container, against a lossless encode; score the outputs locally with VMAF 4K. |
 
 The probes are standalone by design (own image, no `import modal_app`) and cost a few
@@ -207,6 +208,13 @@ one NVENC session at the default settings encodes 4K at 38.5 fps on its own. The
 the encoder-only rate; overlapping VSR with encode on another stream measured no faster.
 **≈36 fps** warm end to end (1080p→4K, `HIGHBITRATE_ULTRA`, defaults), byte-identical
 output across runs.
+
+That is one session. Inputs of **30 s or more** take the segmented path instead
+(`_upscale_video_segmented`): four NVENC sessions, one per engine, on keyframe-aligned
+segments. Warm: ≈75 fps end to end on a 10-min clip (encode phase ≈83), ≈55 fps on the
+61 s sample, whose fixed costs (four encoders 3-9 s, join ~4 s) weigh more. Mean VMAF is
+unchanged (91.27 vs 91.25 against lossless). Shorter inputs keep the
+single-session path above, unchanged, including in-process NVDEC.
 
 The encoder quality point (since 2026-10-03, chosen by VMAF against a lossless encode of
 the same VSR frames) is NVEncC-equivalent `--qvbr 20 --preset p5 --tune uhq --tier high
@@ -316,6 +324,53 @@ Manager Blu-ray sample.
   after the first returned a byte-identical size no matter what changed. Prefer **real
   content**: on synthetic noise the `cq` response measured *inverted*.
 
+### Parallel sessions on segments (inputs ≥ `MODAL_SEGMENTED_MIN_SECONDS`)
+
+`_plan_segments` cuts at source keyframes into a multiple of `NVENC_SESSIONS` segments of
+up to `SEGMENT_SECONDS`. Worker threads from a persistent pool (each keeps its VSR effect
+across jobs) take segments *i, i+N, …*, one NVENC session each, and mux every segment to
+its own mp4 on local disk. ffmpeg's concat demuxer joins them in the final remux. Each of
+these choices was measured; see [docs/PERF-HISTORY.md](docs/PERF-HISTORY.md).
+
+- **Static assignment, not a work queue.** A session's rate control carries across its
+  segments, so which segments a session saw must not depend on scheduling. With static
+  assignment four warm runs were byte-identical.
+- **One continuous session per worker, `FORCEIDR` at each segment start.** Packets are
+  routed to the segment muxer by the session's input index (`timestamp` =
+  `m_frameNum`, never reset), and that muxer is finalized when its count is complete.
+  `EndEncode()` per segment works but cost 15% on one worker.
+- **Device-wide `torch.cuda.synchronize()`, not a per-thread stream.** Per-thread stream
+  syncs were 19% faster and **striped** every output, because nvvfx does not run on the
+  caller's stream.
+- **Hold each P010 surface until the next device-wide sync.** `Encode()` returns before its
+  `cuMemcpy2DAsync` (on PyNvVideoCodec's own non-blocking stream) has read the surface.
+  If the tensor is dropped at once, its memory goes back to torch's allocator, and another
+  thread can overwrite it. Both encode paths do this now.
+- **Every session must emit byte-identical `GetSequenceParams()`.** `FFmpegMuxer` strips
+  the inline VPS/SPS/PPS from IDR packets and the joined file carries one hvcC.
+  `_create_hevc_encoders` enforces it. With the explicit level the sessions always matched.
+- **CreateEncoder error 8 is random** (3-5 in 30 at level 5.1, in any state). The factory
+  makes up to six attempts (five logged retries) before the no-level fallback. The single
+  path uses the same factory.
+- **The segment decode is the piped ffmpeg decoder plus seek and trim:**
+  - input `-ss` one second before the keyframe, relative to the container `start_time`.
+    With the absolute pts, MPEG-TS lost 254 of 1526 frames.
+  - `-copyts` and `trim` in the stream time base.
+  - `-map 0:v:0`, because the keyframe scan reads v:0.
+  - `-enc_time_base:v demux -stats_enc_pre` logs the exact pts of every delivered frame.
+    `_SegmentDecoder.finish()` fails the job unless the first one is the segment's
+    keyframe.
+
+  Verified frame-exact against a sequential decode (framemd5) on mkv, mp4, ts, m2ts and
+  two full episodes. Interlace-flagged input is woven as before. Progressive input loses
+  in-process NVDEC on this path; with each first decoder started during encoder setup and
+  the next one prefetched, `decode-wait` stayed at 0-1%.
+- **One segmented job per container** (`_segment_job_lock`). Two jobs interleaving their
+  pool submissions could each hold part of the pool and wait forever.
+- **Run-to-run identity holds per host driver.** Modal has started placing containers on
+  hosts with driver 610.57.04. Outputs from those hosts differed from the 580 hosts and
+  from each other. Compare sizes within one warm container.
+
 ### Settled — do not re-derive without reading the history first
 
 All of these are measured; details in [docs/PERF-HISTORY.md](docs/PERF-HISTORY.md).
@@ -330,9 +385,11 @@ All of these are measured; details in [docs/PERF-HISTORY.md](docs/PERF-HISTORY.m
   65 fps, P5+fullres+UHQ 38.5, P6 27.5; end to end at the defaults ~36). The old `infer 74%` attribution included time blocked on the
   encoder. Encoder preset *is* the throughput lever now, and so is the number of NVENC
   sessions: the card has **4 NVENC engines** and independent sessions scale (4x P5+HQ
-  210 fps combined, 4x P6+UHQ 66). Chunked parallel encoding is the next speed lever and
-  is not implemented. PyNvVideoCodec 2.2.0 has no `splitEncodeMode` option. Overlapping
-  VSR with a single encoder buys nothing. Batching still does not pay.
+  210 fps combined, 4x P6+UHQ 66). Parallel sessions on segments are implemented
+  (2026-10-04, section above). At P5+UHQ, four sessions give 2.3x encode-only and ~2x end
+  to end, not 4x: each UHQ session slows to ~26 fps when four run. PyNvVideoCodec 2.2.x
+  has no `splitEncodeMode` option. Overlapping VSR with a single encoder buys nothing.
+  Batching still does not pay.
 - **The RTX 4070 comparison is settled.** StaxRip/NVEncC on a 4070 does 71.7 fps with
   P5 + **HQ**; the same settings here measured 68.1 fps per session (encoder clock 1912 vs
   2093 MHz). Per session the cards are equal; the PRO 6000's advantage is four engines.
@@ -355,7 +412,9 @@ All of these are measured; details in [docs/PERF-HISTORY.md](docs/PERF-HISTORY.m
 `AQ_STRENGTH`, `BFRAMES`, `REFS`, `SFE`; `REFS` and `SFE` affect only the piped ffmpeg
 encoder),
 `MODAL_GPU_ENCODER`, `MODAL_GPU_DECODER`, `MODAL_APP_NAME`, `MODAL_GPU`,
-`MODAL_WORKER_CPU`, `MODAL_WORKER_CONCURRENCY`, `MODAL_WORKER_MAX_CONTAINERS`.
+`MODAL_WORKER_CPU`, `MODAL_WORKER_CONCURRENCY`, `MODAL_WORKER_MAX_CONTAINERS`,
+`MODAL_NVENC_SESSIONS` (4; 1 keeps the segmented path's bounded memory on one session),
+`MODAL_SEGMENT_SECONDS` (30), `MODAL_SEGMENTED_MIN_SECONDS` (30).
 
 **They must be baked into the image with `.env()`.** They are read again at container
 import, where the deploying shell's environment does not exist, so a bare
@@ -389,6 +448,9 @@ container looks attractive. Two blockers, both measured:
    but the input and the final output are still written on the mount, so the hazard
    remains for those.
 
+Segmented jobs also serialize on `_segment_job_lock`, since they share one pool and four
+engines.
+
 `run()` only reloads when it is the sole in-flight job, so the default (`concurrency=1`)
 is byte-identical to the old behavior. **Before raising concurrency above 1, job scratch
 must move off the Volume to container-local disk**, with only the finished output copied
@@ -411,6 +473,8 @@ arguments and nothing else — the app imported cleanly for the entire period wh
    of `color_space`, `color_primaries`, `color_transfer`. `unknown` on any of them is a
    bug. It also reports `level=153` (5.1), and two runs of the same input produce the
    same size — a size that jumps ~2.4x between runs means the level/ceiling setup broke.
+   Run both in **one warm container** (back to back, inside the 120 s scale-down window):
+   hosts with different drivers give slightly different bytes.
 6. **Pixels are actually inspected.** Steps 4 and 5 all passed while the GPU encoder was
    emitting visibly corrupt video. Two cheap checks catch it:
    - **No flat frames.** Decode every frame small (`-vf scale=320:180 -f rawvideo
@@ -420,12 +484,23 @@ arguments and nothing else — the app imported cleanly for the entire period wh
      extracted with `-pix_fmt rgb24` (without it, ffmpeg writes 16-bit PNGs from the
      10-bit stream). It should land near the source's own value (~1-3 on the reference
      clip). ~190 means alternating-column striping, i.e. the P010 surface walked as 8-bit.
+   - **Segmented outputs: check the seams too.** Run both checks on the first frame of
+     every segment and the frame before it. A high Laplacian on a seam frame is normal
+     when it matches the unsegmented output, because seams sit on source keyframes.
 7. The `Video done: …` line reports `gpu-encoder=yes` and ~36 fps warm at the default
-   encoder settings (1080p→4K). `nvdec=in-process` is expected for progressive input;
+   encoder settings (1080p→4K) for inputs under 30 s. Inputs of 30 s or more show
+   `sessions=S, segments=N`, where S = min(`NVENC_SESSIONS`, N) is 4 unless the input has
+   too few keyframes to cut four segments. They also show `setup`, `encode` and `join`
+   times. Warm, setup is ~3 s (`effects 0.0s`); the first job in a container pays ~10-14 s
+   of NGX initialization. The encode phase is ~70-80 fps. `nvdec=yes` (piped) is expected
+   unless NVDEC cannot decode the input (then `nvdec=no` plus that WARNING). On the
+   unsegmented path, `nvdec=in-process` is expected for progressive input;
    `nvdec=yes` is expected — and logged with a WARNING — for interlace-flagged input, and
    means the in-process decoder was skipped for any other input. `gpu-encoder` absent
    means the piped encoder ran, a large silent downgrade worth explaining before shipping.
-8. `modal app logs rtx-media-upscaler` shows no warnings or tracebacks. To scope to the
+8. `modal app logs rtx-media-upscaler` shows no warnings or tracebacks. (`NVENC
+   CreateEncoder returned error 8 (intermittent) … retrying` lines are expected; a
+   `WARNING: NVENC rejected explicit HEVC level` after five of them is not.) To scope to the
    worker, `modal function logs 'rtx-media-upscaler/UpscaleWorker.*' --tail 200` (SDK ≥
    1.6.0); `modal app logs <app> --function-call fc-…` isolates one job.
 9. `/health` returns 401 without proxy-auth headers.
