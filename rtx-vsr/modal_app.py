@@ -180,7 +180,7 @@ gpu_image = (
         "opencv-python-headless==5.0.0.93",
         "pillow==12.3.0",
         "torch==2.13.0",
-        "nvidia-vfx==0.1.0.1",
+        "nvidia-vfx==0.2.0.0",
         "PyNvVideoCodec==2.2.3",
     )
     # NVENC_PRESET is read again at container import, where the deploying shell's
