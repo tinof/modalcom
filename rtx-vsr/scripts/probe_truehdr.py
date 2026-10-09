@@ -410,13 +410,14 @@ def case(name: str, ctx: dict) -> str:
             colr = Path(out).read_bytes().find(b"colrnclx")
             p(f"mp4 colr nclx box present: {colr > 0}")
             trace = subprocess.run(
-                ["ffmpeg", "-v", "error", "-i", out, "-frames:v", "1", "-c", "copy", "-bsf:v", "trace_headers",
+                # trace_headers prints at info level; at -v error it prints nothing.
+                ["ffmpeg", "-v", "info", "-i", out, "-frames:v", "1", "-c", "copy", "-bsf:v", "trace_headers",
                  "-f", "null", "-"], capture_output=True, text=True).stderr
             for key in ("max_display_mastering_luminance", "max_content_light_level",
                         "max_pic_average_light_level", "colour_primaries", "transfer_characteristics",
-                        "matrix_coeffs", "chroma_sample_loc_type_top_field"):
+                        "matrix_coefficients", "chroma_sample_loc_type_top_field"):
                 hits = [ln.split("]")[-1].strip() for ln in trace.splitlines() if key in ln]
-                p(f"trace {key}: {hits[:2]}")
+                p(f"trace {key}: {hits[:2] if hits else 'MISSING'}")
             decoded = subprocess.run(["ffmpeg", "-v", "error", "-i", out, "-f", "rawvideo", "-pix_fmt", "p010le",
                                       "-"], capture_output=True).stdout
             per = 3840 * 2160 * 3 // 2

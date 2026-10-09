@@ -1167,7 +1167,9 @@ def _is_ten_bit_sdr(hints: dict[str, str]) -> bool:
     of being rounded to 8 at decode. HDR sources keep the 8-bit path they always had.
     """
     pix_fmt = hints.get("pix_fmt", "")
-    deep = re.search(r"p0(1[0-6])|(?:9|1[0-6])(?:le|be)$", pix_fmt) is not None
+    # Planar/semi-planar 9-16 bit (yuv420p10le, p010le, ...) and packed 16-bit RGB (rgb48le,
+    # bgr48be, rgba64le, ...).
+    deep = re.search(r"p0(1[0-6])|(?:9|1[0-6]|48|64)(?:le|be)$", pix_fmt) is not None
     return deep and not _is_hdr_source(hints)
 
 
