@@ -33,7 +33,7 @@ image = (
         "ldconfig",
         "rm -rf /tmp/nv.run /tmp/nvx",
     )
-    .uv_pip_install("numpy==2.5.2", "torch==2.13.0", "nvidia-vfx==0.1.0.1", "PyNvVideoCodec==2.2.3")
+    .uv_pip_install("numpy==2.5.2", "torch==2.13.0", "nvidia-vfx==0.2.0.0", "PyNvVideoCodec==2.2.3")
 )
 app = modal.App("rtx-probe-quality", image=image)
 vol = modal.Volume.from_name("rtx-upscaler-jobs")

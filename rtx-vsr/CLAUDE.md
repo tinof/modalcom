@@ -118,7 +118,9 @@ or "premature optimization".
 ### 5. Quality modes: four families, two roles
 
 `nvvfx.VideoSuperRes.QualityLevel` has 19 members in four families, **all probed working**
-on `RTX-PRO-6000` / driver 580.95.05:
+on `RTX-PRO-6000` / driver 580.95.05. nvidia-vfx 0.2.0.0 adds `STREAMING_MEDIUM` (21) and
+`STREAMING_ULTRA` (23); they are not in `UPSCALE_QUALITIES` and are rejected until
+someone probes and decides on them.
 
 - `BICUBIC, LOW..ULTRA` (0-4) and `HIGHBITRATE_LOW..ULTRA` (16-19) **change resolution** —
   valid for `quality`. The standard family also suppresses compression artifacts, so it
@@ -164,6 +166,104 @@ preprocess change, measure flicker across consecutive frames in a static patch.
 `detail_vs_noise` in `scripts/preprocess_sweep.py` covers the spatial half; the temporal
 half is a mean abs diff between consecutive frames in a static region.
 
+### 6. HDR10 output (TrueHDR) and 10-bit sources
+
+`truehdr` turns SDR video into HDR10 with `nvvfx.TrueHDR` (nvidia-vfx 0.2.0.0, pinned
+since 2026-10-04). Its parameters and defaults reproduce a StaxRip/NVEncC command line
+(`--vpp-ngx-truehdr contrast=102,saturation=102,middlegray=46,maxluminance=680`,
+`--master-display`, `--max-cll`); NVEncC passes the same four tunables 1:1 to the same NGX
+feature. Everything below was probed with `scripts/probe_truehdr.py`.
+
+- **Order: VSR, then TrueHDR at output size.** NVEncC's filter order is fixed: resize,
+  pad, TrueHDR, regardless of the command line. VSR on TrueHDR's PQ output overshot
+  bright edges from code 720 to 900 (about 650 to 3200 nits). Do not move TrueHDR ahead
+  of VSR to save pixels.
+- **I/O:**
+  - Input is (3,H,W) float in [0,1].
+  - Output is (H,W) uint32 RGB10A2: R in bits 0-9, alpha 3. The codes are *full-range*
+    10-bit PQ in BT.2020 primaries. Black is 0, and white maps to about `maxluminance` nits.
+  - The output is the SDK's reused DLPack buffer, so the `.clone()` is mandatory, as for VSR.
+- **TrueHDR sizes itself on the first `run()`, not at `load()`.** `_true_hdr()` does a
+  warm-up run at the output size before `CreateEncoder`, which keeps the error-8 rule
+  (effects settle their size before the encoder exists).
+- **Stateless and thread-safe in our scheme.** Same frames forwards and backwards gave
+  identical outputs. Four threads (own effects, legacy stream, device-wide sync) matched a
+  one-thread reference on every P010 hash. It works up to 8192x4320 (`MAX_HDR_OUTPUT_PIXELS`).
+- **Cost:**
+  - TrueHDR takes ~1 ms per 4K frame. `_hdr10_to_p010` takes 1.2 ms including the MaxCLL
+    accumulation (1.7 ms with int64 planes; keep it int32).
+  - Single session: HDR runs at SDR speed (34-37 fps), because the encoder is the bound.
+  - Segmented: the encode phase is 14-18% slower (55-63 against 67-72 fps). The GPU is not
+    saturated; every thread's device-wide sync waits on all threads' extra work. The `sz`
+    stream scheme is the lever. Keep per-frame HDR work off the full frame where a
+    subsample will do (the integrity stats use 1/16).
+  - The encode round trip is ordinary codec loss: signed error ≈ 0, and the absolute error
+    is below SDR's on the same frames.
+  - PQ packs SDR-range content into fewer codes (Y std 64 vs 88), so at CQ 20 HDR files
+    came out ~28% smaller than SDR (19.6 vs 27.1 MB for 60 frames).
+- **`_hdr10_to_p010`:**
+  - BT.2020 NCL (Kr 0.2627, Kb 0.0593, ÷1.8814 / ÷1.4746), limited range.
+  - 4:2:0 at real top-left siting: [1,2,1]/4 in both axes, centred on even rows and
+    columns. It is built from slices and adds, not conv2d, so no cuDNN algorithm choice
+    can change bytes.
+  - Within ±1 code of a float64 reference.
+  - NVEncC signals `--chromaloc 2` but samples type 0; we signal 2 and sample 2.
+- **Colour signalling:** `_remux_color_args()`.
+  - `hevc_metadata` writes 9/16/9, limited range and `chroma_sample_loc_type=2` into the SPS.
+  - HDR also passes the four output colour options, so the mp4 gets a `colr` (nclx) box.
+    `hevc_metadata` alone edits only the bitstream.
+  - The SDR arguments are byte-for-byte the old ones.
+- **HDR10 static metadata is in-band SEI, inserted in Python.**
+  - PyNvVideoCodec 2.2.3 has no kwarg for mastering display or CLL. It also has none for
+    VUI colour or chroma location: `colorspace` sets no presence flags.
+  - `hdr10_sei_nals()` builds two prefix-SEI NAL units, MDCV (137) and CLL (144).
+    - They are byte-identical to libx265's for the default settings.
+    - Emulation prevention is required: the default min luminance 1 is `00 00 00 01`.
+  - `insert_sei_before_irap_slice()` puts them before the first slice of every IRAP packet
+    (NAL 16-21), after NVENC's own picture-timing SEI. That covers the gop-250 IDRs and every
+    segment's FORCEIDR frame.
+  - FFmpegMuxer strips only VPS/SPS/PPS, and concat + `hevc_metadata` keep the SEI.
+  - Our copy remux has no way to attach the side data ffmpeg's mp4 muxer would need for
+    `mdcv`/`clli` boxes. NVEncC writes none either.
+- **MaxCLL/MaxFALL are measured per job unless `max_cll` is given** (contract change:
+  outputs made before carried the static 680/300). `HdrSettings.measure_cll`.
+  - The encode writes a placeholder, the old static default (`maxluminance`,
+    `min(300, maxluminance)`), so a refused patch still leaves sane values.
+  - After the last frame and before the final remux, `patch_cll_sei()` overwrites the 4
+    CLL payload bytes in the **local** intermediates (single path: the video-only mp4;
+    segmented: every segment mp4, all with the same whole-job values). Never on the
+    Volume. The `-c:v copy` remux and concat carry the SEI through unchanged.
+  - The pattern is the mp4 length prefix plus the escaped NAL. The replacement must have
+    the same escaped length: values are rounded up, clamped to 1..65535 with
+    MaxFALL <= MaxCLL, and if emulation prevention would change the length (MaxCLL a
+    multiple of 256 with MaxFALL <= 3), MaxCLL is nudged up one nit at a time.
+  - Count check: every file is scanned first, and the matches must equal the SEIs
+    `insert_sei_before_irap_slice` actually inserted (counted in `_mux` and `route()`).
+    Otherwise nothing is written and a `WARNING: HDR10 MaxCLL/MaxFALL not patched` names
+    the cause; the output keeps the placeholder.
+  - Log: `HDR10 light levels: measured MaxCLL/MaxFALL c/d nits; written c'/d' (measured |
+    explicit max_cll | static fallback)`.
+  - The dark drama test clips measured MaxFALL 30-52 nits; full films with bright scenes
+    measure higher. Letterbox bars count in the frame average, so MaxFALL reads slightly
+    low on letterboxed sources (~1.33x for 2.39:1). Excluding them is a possible
+    refinement.
+- **Rejected with 400 (`HdrRequestError`):**
+  - image inputs;
+  - PQ or HLG sources;
+  - outputs above 8192x4320;
+  - the piped fallback, which writes SDR only and must not do so silently.
+- **10-bit sources.**
+  - SDR sources with ≥10-bit pix_fmt decode through ffmpeg as `x2bgr10le`, which is
+    exactly nvvfx's RGB10A2 layout. VSR and the preprocess then run in RGB10A2
+    (`input_size` selects it and is part of the effect cache key).
+  - In-process NVDEC delivers 8-bit RGB only, so these inputs always take the piped decoder.
+  - Against the verified-exact rgb24 path, x2bgr10le reads +0.5 codes high (0.12/255) on
+    real content and on a grey ramp. An rgb48 decode reads 1-1.5 codes *low*, so it is no
+    better reference.
+  - DENOISE/DEBLUR in RGB10A2 return words *without* alpha 3, so `_upscale_rgb_batch`
+    sets it again before VSR.
+  - TrueHDR's model is 8-bit, so for HDR output the gain is VSR precision only.
+
 ## The scripts directory
 
 | Script | Use it when |
@@ -177,7 +277,8 @@ half is a mean abs diff between consecutive frames in a static region.
 | `verify_roundtrip.py` | Running the deployed worker on a Volume-staged job, warm, without proxy tokens. `MODAL_APP_NAME` selects a bench deploy. |
 | `probe_nvdec_interlace.py` | Re-testing whether in-process NVDEC still deinterlaces interlace-flagged PsF input (row-parity diff against ffmpeg's woven decode). |
 | `probe_stages.py` | Per-stage timing: VSR alone, encode alone per preset, serial vs overlapped, N concurrent NVENC sessions. One encoder per single-use container. |
-| `probe_parallel_encode.py` | Several NVENC sessions in one process: encode-only scaling, per-thread pipelines (and their pixels), segment joins, CreateEncoder error-8 rates, and a segmented prototype on a staged clip. |
+| `probe_parallel_encode.py` | Several NVENC sessions in one process: encode-only scaling (HQ/UHQ, with or without the ceiling, threads or processes, with nvidia-smi utilisation), per-thread pipelines and their stream schemes (with md5 and exact P010 checksums via `:hash`), segment joins, CreateEncoder error-8 rates, and a segmented prototype on a staged clip. `PROBE_VFX=0.1.0.1` re-tests the old nvvfx wheel (default: the production 0.2.0.0). |
+| `probe_truehdr.py` | TrueHDR and RGB10A2 behaviour: API surface, statelessness, 4-thread hashes, size limits, `_hdr10_to_p010` against float64, the full HDR encode with SEI and remux checks, 10-bit decode and preprocess. Runs modal_app's own helpers (sources passed in via `inspect`). |
 | `probe_encoder_quality.py` | Encoder settings vs quality: same VSR frames, one encoder per container, against a lossless encode; score the outputs locally with VMAF 4K. |
 
 The probes are standalone by design (own image, no `import modal_app`) and cost a few
@@ -231,7 +332,12 @@ Manager Blu-ray sample.
   surface from the encoder ASIC, which takes no part in CUDA stream ordering, so it can
   start reading before the kernels filling that surface have run. Removing the sync
   returns alternating-column striping and flat grey frames. Full post-mortem in
-  [docs/PERF-HISTORY.md](docs/PERF-HISTORY.md).
+  [docs/PERF-HISTORY.md](docs/PERF-HISTORY.md). Refined 2026-10-04: the encoder's input
+  copy runs on the stream PyNvVideoCodec registers with NVENC (`nvEncSetIOCudaStreams`).
+  Our `__dlpack__` patch drops the consumer stream that would order that copy after our
+  kernels. With the ordering made explicit (the `sz` design in
+  `probe_parallel_encode.py`), no host sync was needed and the output stayed
+  byte-identical. In the current code the sync is still mandatory.
 - **PyNvVideoCodec silently drops unknown kwargs** into a `map<string,string>` with no
   validation, so a typo costs quality and raises nothing. The quality key is **`cq`**
   (NVENC `targetQuality`), not `qp`. Tuning values are **`uhq`** and **`high_quality`**
@@ -340,8 +446,17 @@ these choices was measured; see [docs/PERF-HISTORY.md](docs/PERF-HISTORY.md).
   `m_frameNum`, never reset), and that muxer is finalized when its count is complete.
   `EndEncode()` per segment works but cost 15% on one worker.
 - **Device-wide `torch.cuda.synchronize()`, not a per-thread stream.** Per-thread stream
-  syncs were 19% faster and **striped** every output, because nvvfx does not run on the
-  caller's stream.
+  syncs were 19% faster and **striped** every output.
+- **nvvfx ignores `stream_ptr` for its own copies** (0.1.0.1 and 0.2.0.0, probed
+  2026-10-04). `run()` does its input transfer and output copy (`get_output()`) on the
+  legacy default stream, whatever `stream_ptr` says. On a non-blocking stream, frame *i*'s
+  P010 equalled the correct frame *i−1*, and the four threads disagreed on ~20% of frames.
+  The output looked fine (no striping, plausible Laplacian). Only byte comparison across
+  threads and exact P010 checksums showed it.
+  - Any stream scheme must treat `run()` as legacy-stream work. Join it to the worker's
+    stream with events, and `record_stream` the input onto the legacy stream.
+  - Blocking streams also fix it, but cost ~15%.
+  - The ~100 fps of the concurrent-VSR variants was wrong output, not headroom.
 - **Hold each P010 surface until the next device-wide sync.** `Encode()` returns before its
   `cuMemcpy2DAsync` (on PyNvVideoCodec's own non-blocking stream) has read the surface.
   If the tensor is dropped at once, its memory goes back to torch's allocator, and another
@@ -506,6 +621,18 @@ arguments and nothing else — the app imported cleanly for the entire period wh
    worker, `modal function logs 'rtx-media-upscaler/UpscaleWorker.*' --tail 200` (SDK ≥
    1.6.0); `modal app logs <app> --function-call fc-…` isolates one job.
 9. `/health` returns 401 without proxy-auth headers.
+10. **Any change near the HDR path** also runs an HDR job (`truehdr=on`), both short
+    (single session) and ≥30 s (segmented). Check all of these:
+    - `ffprobe`: bt2020nc / bt2020 / smpte2084, `chroma_location=topleft`, `Main 10`, level 153.
+    - The mp4 has a `colr` nclx box.
+    - `ffprobe -skip_frame nokey -show_frames` lists "Mastering display metadata" and
+      "Content light level metadata" on **every** keyframe, seams included. An IDR without
+      them drops the metadata for its whole sequence.
+    - Step 6's pixel checks on tone-mapped frames
+      (`zscale=t=linear,tonemap=hable,zscale=p=709:t=709:m=709`).
+    - The `HDR10 light levels:` line is present, and fps is within a few percent of SDR.
+    - Also run a 10-bit SDR source and a mixed sequence in one container (image, SDR 4K,
+      HDR 4K, SDR 1620p, 10-bit, HDR 4K). Effects that change size are where error 8 lives.
 
 **The lasting lesson of the striping bug is verification, not encoders:** for a full day
 that path produced visibly broken 4K while passing frame count, `ffprobe`, a clean decode

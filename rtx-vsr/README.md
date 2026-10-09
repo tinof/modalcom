@@ -58,7 +58,8 @@ safer default for MP4 playback.
 
 Video jobs run **entirely on the GPU**: NVDEC decodes, super-resolution runs on the decoded
 CUDA tensor, and NVENC encodes straight from GPU memory. Output is **HEVC Main 10**
-(`yuv420p10le`, Level 5.1 High tier) tagged bt709 for matrix, primaries and transfer.
+(`yuv420p10le`, Level 5.1 High tier) tagged bt709 for matrix, primaries and transfer, or
+HDR10 when `truehdr` is set (see below).
 
 ### Default encoder settings
 
@@ -91,6 +92,72 @@ some warm-container states (a job right after one with a different output size) 
 rejects the explicit level; the worker then retries with the driver's level and logs a
 warning. The ceiling, and so the file size, is the same either way. Expect output bitrate to follow the content:
 grainy 4K at CQ 20 lands roughly between 35 and 80 Mbps.
+
+### HDR10 output (TrueHDR)
+
+Pass `truehdr` to turn an SDR video into HDR10. NVIDIA's TrueHDR model (nvidia-vfx
+0.2.0.0) runs on each frame after super-resolution, at output size, in the same GPU loop
+as VSR and the encoder. The output is HEVC Main 10 tagged BT.2020 / PQ (SMPTE ST 2084) /
+BT.2020 non-constant luminance, limited range, with chroma sited top-left. Every keyframe
+carries the HDR10 mastering-display and content-light-level SEI. The mp4 also gets a
+`colr` box.
+
+The parameters follow NVEncC/StaxRip, so a desktop command line carries over:
+
+| StaxRip / NVEncC | This service | Default |
+|---|---|---|
+| `--vpp-ngx-truehdr contrast=…,saturation=…,middlegray=…,maxluminance=…` | `truehdr` (same `key=value` list, or `on` for the defaults) | `contrast=102,saturation=102,middlegray=46,maxluminance=680` |
+| (no switch) | `truehdr=…,debanding=off` skips TrueHDR's debanding pass | debanding on |
+| `--master-display "G(…)B(…)R(…)WP(…)L(max,min)"` | `master_display` (same string) | `G(8500,39850)B(6550,2300)R(35400,14600)WP(15635,16450)L(<maxluminance>×10000,1)` |
+| `--max-cll "MaxCLL,MaxFALL"` | `max_cll` (same string; 0 = unknown) | measured per job |
+| `--colormatrix bt2020nc --colorprim bt2020 --transfer smpte2084 --chromaloc 2` | always set when `truehdr` is on | |
+| `--vpp-resize algo=ngx-vsr,vsr-quality=4` | `quality=ULTRA` | `HIGHBITRATE_ULTRA` (better on clean sources, see below) |
+
+```bash
+python modal_client.py --endpoint "$ENDPOINT" --input ./episode.mkv --scale 2.0 \
+	--truehdr "contrast=102,saturation=102,middlegray=46,maxluminance=680"
+```
+
+Notes:
+- **Order matches NVEncC.** NVEncC applies resize, then pad, then TrueHDR, whatever the
+  command-line order. VSR therefore always sees SDR. Running VSR on PQ data instead made
+  bright edges overshoot from about 650 to about 3200 nits in a probe.
+- **No crop or pad.** StaxRip's `--vpp-pad` puts back bars it cropped earlier. Here the
+  output keeps the source aspect. Black stays at 0 nits through TrueHDR, so bars inside the
+  source stay black.
+- **The default primaries are BT.2020.** The default `master_display` primaries (G 0.170/0.797,
+  R 0.708/0.292) are BT.2020, not P3, as in the reference StaxRip command. P3-D65,
+  `G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(…)`, is the common disc
+  convention; pass it if you prefer it.
+- **MaxCLL/MaxFALL are measured per job by default.** Without `max_cll`, the worker measures
+  the brightest pixel and the brightest frame average of the frames it encoded and writes
+  those values (rounded up) into the content-light-level SEI on every keyframe. An explicit
+  `max_cll="a,b"` is written as given. This is a contract change: outputs made before it
+  carried the static `<maxluminance>,300` (680/300). The 300 nits of the StaxRip command
+  overstate MaxFALL a lot on dark drama: the test clips measured 30-52 nits. Full films with
+  bright scenes measure higher, which is why the value is measured per job rather than
+  replaced by another constant. The worker log prints both (`HDR10 light levels: measured
+  … ; written … (measured)`). Letterbox bars count in the frame average, so MaxFALL reads
+  slightly low on letterboxed sources (about 1.33x low for 2.39:1 in a 16:9 frame).
+- **Speed.** TrueHDR adds about 1 ms of GPU work per 4K frame and the BT.2020
+  conversion about 1.2 ms. On the single-session path (inputs under 30 s) HDR runs at SDR
+  speed. On the four-session path, the encode phase measured 14-18% slower (55-63 against
+  67-72 fps), because every session's per-frame sync waits on the others' extra GPU work.
+  `debanding=off` cut TrueHDR from 0.31 to 0.14 ms per frame at 1080p.
+- **What is rejected (`400`):** image inputs, sources that are already HDR (PQ or HLG
+  transfer), and outputs above 8192x4320.
+  Without the GPU encoder path the job fails instead of silently writing SDR.
+
+### 10-bit sources
+
+SDR sources with 10 or more bits per sample (for example `yuv420p10le` HEVC) are decoded
+as packed 10-bit RGB (`x2bgr10le`). VSR and any `preprocess` pass then run in nvvfx's
+RGB10A2 mode, so the extra precision reaches the model. Before 2026-10 these sources were
+rounded to 8 bits at decode, so their output pixels now differ slightly. The 10-bit path
+does not touch 8-bit sources. Separately, the nvidia-vfx 0.2.0.0 upgrade itself moved about
+3% of VSR output values by exactly 1/255 for every source (see
+[docs/PERF-HISTORY.md](docs/PERF-HISTORY.md)). These inputs use the piped ffmpeg NVDEC decoder, because in-process NVDEC
+delivers 8-bit RGB only, and the log says so. HDR sources keep the 8-bit path.
 
 ### Interlace-flagged sources (UK/EU Blu-ray and broadcast)
 
@@ -456,6 +523,10 @@ curl -X POST "https://<workspace>--rtx-media-upscaler-api.modal.run/upscale" \
 	-F "scale=2.0" \
 	-F "quality=ULTRA"
 ```
+
+For HDR10 video output add `-F "truehdr=on"` (or a `contrast=…,maxluminance=…` list), and
+optionally `-F "master_display=G(…)B(…)R(…)WP(…)L(…,…)"` and `-F "max_cll=680,300"`
+(without `max_cll`, the measured values are written).
 
 Poll for the result. While the job runs this returns HTTP 202; on completion it returns the file:
 

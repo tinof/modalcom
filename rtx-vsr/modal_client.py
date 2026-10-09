@@ -87,6 +87,27 @@ def run() -> None:
         help="Optional same-resolution restoration pass applied before upscaling.",
     )
     parser.add_argument(
+        "--truehdr",
+        nargs="?",
+        const="on",
+        default="",
+        help=(
+            "SDR->HDR10 output (video). Bare --truehdr uses the defaults "
+            "(contrast=102,saturation=102,middlegray=46,maxluminance=680); or pass NVEncC "
+            "--vpp-ngx-truehdr syntax, optionally with debanding=off."
+        ),
+    )
+    parser.add_argument(
+        "--master-display",
+        default="",
+        help='HDR10 mastering display, NVEncC/x265 syntax: "G(x,y)B(x,y)R(x,y)WP(x,y)L(max,min)".',
+    )
+    parser.add_argument(
+        "--max-cll", default="",
+        help='HDR10 "MaxCLL,MaxFALL" in nits, e.g. "680,300" (0 = unknown). '
+             "Empty (default): measured per job from the output frames.",
+    )
+    parser.add_argument(
         "--no-keep-aspect-ratio",
         action="store_false",
         dest="keep_aspect_ratio",
@@ -118,6 +139,9 @@ def run() -> None:
             "keep_aspect_ratio": str(args.keep_aspect_ratio).lower(),
             "quality": args.quality,
             "preprocess": args.preprocess,
+            "truehdr": args.truehdr,
+            "master_display": args.master_display,
+            "max_cll": args.max_cll,
         }
 
         with input_path.open("rb") as f:
