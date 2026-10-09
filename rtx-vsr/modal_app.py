@@ -1,9 +1,13 @@
 import contextlib
 import dataclasses
+import math
+import mmap
 import os
 import queue
+import re
 import resource
 import shutil
+import struct
 import subprocess
 import tempfile
 import threading
@@ -120,6 +124,8 @@ MAX_PIXELS = 1024 * 1024 * 16
 MAX_BATCH = int(os.getenv("MODAL_MAX_BATCH", "1")) or None
 MAX_OUTPUT_EDGE = 16384
 MAX_VSR_EDGE = 15360
+# Largest output TrueHDR was verified at (scripts/probe_truehdr.py `sizes`, 2026-10-04).
+MAX_HDR_OUTPUT_PIXELS = 8192 * 4320
 JOBS_DIR = Path("/jobs")
 
 # RTX Video Super Resolution is an NGX feature. The nvidia-vfx wheel bundles the
@@ -291,6 +297,342 @@ def _normalize_quality(raw_quality: str) -> str:
     return normalized
 
 
+# SDR->HDR10 output (nvvfx.TrueHDR). The defaults reproduce the reference StaxRip/NVEncC
+# settings this feature was built to match:
+#   --vpp-ngx-truehdr contrast=102,saturation=102,middlegray=46,maxluminance=680
+#   --master-display "G(8500,39850)B(6550,2300)R(35400,14600)WP(15635,16450)L(6800000,1)"
+#   --max-cll "680,300"
+# NVEncC passes the four tunables 1:1 to the same NGX feature, with the same ranges.
+# The mastering primaries are BT.2020 (not P3) with a D65 white point; the mastering peak
+# and MaxCLL follow maxluminance unless given explicitly.
+TRUEHDR_DEFAULTS = {"contrast": 102, "saturation": 102, "middlegray": 46, "maxluminance": 680}
+TRUEHDR_RANGES = {
+    "contrast": (0, 200), "saturation": (0, 200), "middlegray": (10, 100), "maxluminance": (400, 2000),
+}
+TRUEHDR_KEY_ALIASES = {
+    "contrast": "contrast", "saturation": "saturation",
+    "middlegray": "middlegray", "middle_gray": "middlegray",
+    "maxluminance": "maxluminance", "luminance": "maxluminance", "max_luminance": "maxluminance",
+}
+DEFAULT_MASTER_PRIMARIES = (8500, 39850, 6550, 2300, 35400, 14600, 15635, 16450)  # G, B, R, WP
+DEFAULT_MASTER_MIN_LUMINANCE = 1  # 0.0001 cd/m2
+DEFAULT_MAX_FALL = 300
+_ON_VALUES = frozenset({"on", "true", "yes", "1", "default"})
+_OFF_VALUES = frozenset({"", "off", "false", "no", "0", "none"})
+
+
+class HdrRequestError(ValueError):
+    """An HDR10 request that cannot be honoured for this input (reported as HTTP 400)."""
+
+
+@dataclasses.dataclass(frozen=True)
+class HdrSettings:
+    """TrueHDR tunables plus the HDR10 static metadata written into the stream."""
+
+    contrast: int
+    saturation: int
+    middle_gray: int
+    luminance: int
+    debanding: bool
+    # Mastering display: G, B, R, white point x/y in 0.00002 units (HEVC MDCV order).
+    primaries: tuple[int, ...]
+    max_mastering_luminance: int  # 0.0001 cd/m2
+    min_mastering_luminance: int  # 0.0001 cd/m2
+    # Written at encode time. With measure_cll these are only the placeholder (the old
+    # static default); patch_cll_sei() replaces them with the measured values after the
+    # encode, and they stay in the file only if that patch is refused (with a WARNING).
+    max_cll: int
+    max_fall: int
+    measure_cll: bool  # no explicit max_cll: signal the light levels measured per job
+
+    def describe(self) -> str:
+        cll = ("measured" if self.measure_cll
+               else f"{self.max_cll}/{self.max_fall}")
+        return (
+            f"truehdr(contrast={self.contrast}, saturation={self.saturation}, "
+            f"middlegray={self.middle_gray}, maxluminance={self.luminance}, "
+            f"debanding={'on' if self.debanding else 'off'}; "
+            f"master L {self.max_mastering_luminance / 10000:g}/"
+            f"{self.min_mastering_luminance / 10000:g} nits, "
+            f"MaxCLL/MaxFALL {cll})"
+        )
+
+
+def parse_hdr_settings(truehdr: str | None, master_display: str | None = None,
+                       max_cll: str | None = None) -> HdrSettings | None:
+    """Validate the HDR form fields without importing nvvfx (the web tier has no GPU image).
+
+    `truehdr` is empty/"off" for SDR output, "on" for the defaults, or NVEncC
+    --vpp-ngx-truehdr syntax: "contrast=102,saturation=102,middlegray=46,maxluminance=680",
+    plus "debanding=on|off". `master_display` takes the NVEncC/x265 --master-display string
+    and `max_cll` "MaxCLL,MaxFALL"; both are only valid together with `truehdr`. An empty
+    `max_cll` means "measure it": the job signals the MaxCLL/MaxFALL of its own frames.
+    0 is HDR10's "unknown", so either value may be 0.
+    """
+    raw = (truehdr or "").strip()
+    master_raw = (master_display or "").strip()
+    cll_raw = (max_cll or "").strip()
+    if raw.lower() in _OFF_VALUES:
+        if master_raw or cll_raw:
+            raise ValueError("master_display and max_cll apply only together with truehdr.")
+        return None
+
+    values = dict(TRUEHDR_DEFAULTS)
+    debanding = True
+    if raw.lower() not in _ON_VALUES:
+        for item in raw.split(","):
+            key, sep, value = item.partition("=")
+            key = key.strip().lower().replace("-", "_")
+            value = value.strip().lower()
+            if not sep or not key or not value:
+                raise ValueError(f"truehdr: expected key=value pairs, got {item.strip()!r}.")
+            if key in {"debanding", "deband"}:
+                if value not in _ON_VALUES | _OFF_VALUES:
+                    raise ValueError(f"truehdr: debanding must be on or off, got {value!r}.")
+                debanding = value in _ON_VALUES
+                continue
+            name = TRUEHDR_KEY_ALIASES.get(key)
+            if name is None:
+                raise ValueError(
+                    f"truehdr: unknown key {key!r}; use contrast, saturation, middlegray, "
+                    "maxluminance and debanding."
+                )
+            try:
+                values[name] = int(value)
+            except ValueError:
+                raise ValueError(f"truehdr: {name} must be an integer, got {value!r}.") from None
+    for name, (low, high) in TRUEHDR_RANGES.items():
+        if not low <= values[name] <= high:
+            raise ValueError(f"truehdr: {name} must be in [{low}, {high}], got {values[name]}.")
+    luminance = values["maxluminance"]
+
+    if master_raw:
+        compact = "".join(master_raw.split()).upper()
+        match = re.fullmatch(
+            r"G\((\d+),(\d+)\)B\((\d+),(\d+)\)R\((\d+),(\d+)\)WP\((\d+),(\d+)\)L\((\d+),(\d+)\)",
+            compact,
+        )
+        if match is None:
+            raise ValueError(
+                "master_display must look like "
+                "G(x,y)B(x,y)R(x,y)WP(x,y)L(max,min), as in NVEncC/x265 --master-display."
+            )
+        numbers = [int(group) for group in match.groups()]
+        primaries, (max_l, min_l) = tuple(numbers[:8]), numbers[8:]
+        if any(value > 50000 for value in primaries):
+            raise ValueError("master_display: chromaticities are in 0.00002 units, at most 50000.")
+        if not 0 <= min_l < max_l <= 10000 * 10000:
+            raise ValueError(
+                "master_display: L(max,min) is in 0.0001 cd/m2 with min < max <= 10000 nits."
+            )
+    else:
+        primaries = DEFAULT_MASTER_PRIMARIES
+        max_l, min_l = luminance * 10000, DEFAULT_MASTER_MIN_LUMINANCE
+
+    if cll_raw:
+        parts = [part.strip() for part in cll_raw.split(",")]
+        if len(parts) != 2 or not all(part.isdigit() for part in parts):
+            raise ValueError('max_cll must be "MaxCLL,MaxFALL" in nits, e.g. "680,300".')
+        cll, fall = (int(part) for part in parts)
+        if cll > 65535 or fall > 65535:
+            raise ValueError("max_cll: MaxCLL and MaxFALL must be at most 65535.")
+        if cll and fall and fall > cll:
+            raise ValueError("max_cll: MaxFALL cannot exceed MaxCLL (0 means unknown).")
+        measure = False
+    else:
+        # Placeholder written at encode time and replaced after it (patch_cll_sei).
+        cll, fall = luminance, min(DEFAULT_MAX_FALL, luminance)
+        measure = True
+
+    return HdrSettings(
+        contrast=values["contrast"], saturation=values["saturation"],
+        middle_gray=values["middlegray"], luminance=luminance, debanding=debanding,
+        primaries=primaries, max_mastering_luminance=max_l, min_mastering_luminance=min_l,
+        max_cll=cll, max_fall=fall, measure_cll=measure,
+    )
+
+
+_ANNEXB_START = b"\x00\x00\x00\x01"
+
+
+def _escape_rbsp(rbsp: bytes) -> bytes:
+    """HEVC emulation prevention: a 03 after every 00 00 that precedes a byte <= 03."""
+    escaped = bytearray()
+    zeros = 0
+    for byte in rbsp:
+        if zeros >= 2 and byte <= 3:
+            escaped.append(3)
+            zeros = 0
+        escaped.append(byte)
+        zeros = zeros + 1 if byte == 0 else 0
+    return bytes(escaped)
+
+
+def _sei_nal(payload_type: int, payload: bytes) -> bytes:
+    """One Annex-B prefix SEI NAL unit (type 39) carrying a single SEI message."""
+    rbsp = bytes([payload_type, len(payload)]) + payload + b"\x80"  # + rbsp_trailing_bits
+    # Emulation prevention over everything after the NAL header. The default minimum
+    # mastering luminance (1) is 00 00 00 01 in the payload -- a start code otherwise.
+    return _ANNEXB_START + b"\x4e\x01" + _escape_rbsp(rbsp)
+
+
+def _cll_sei_nal(max_cll: int, max_fall: int) -> bytes:
+    """The content light level SEI (payload 144) as an Annex-B NAL unit."""
+    return _sei_nal(144, struct.pack(">2H", max_cll, max_fall))
+
+
+def hdr10_sei_nals(hdr: HdrSettings) -> bytes:
+    """Mastering display colour volume (137) and content light level (144), one NAL each.
+
+    Separate NAL units, as x265 writes them; NVENC's own picture-timing SEI must not share
+    a NAL unit with other payload types.
+    """
+    mdcv = struct.pack(
+        ">8H2I", *hdr.primaries, hdr.max_mastering_luminance, hdr.min_mastering_luminance
+    )
+    return _sei_nal(137, mdcv) + _cll_sei_nal(hdr.max_cll, hdr.max_fall)
+
+
+def insert_sei_before_irap_slice(packet: bytes, sei: bytes) -> bytes:
+    """Insert `sei` ahead of the first slice of an IRAP access unit; other packets unchanged.
+
+    The SEI goes after the parameter sets and any SEI NVENC wrote (picture timing), just
+    before the first VCL NAL unit, which is where a prefix SEI belongs. Only the NAL
+    headers ahead of the first slice are scanned; slice data is never walked in Python.
+    IRAP is decided from the NAL type (16-21), so the periodic IDRs and every segment's
+    FORCEIDR frame are covered alike.
+    """
+    index = packet.find(b"\x00\x00\x01")
+    while index != -1 and index + 3 < len(packet):
+        nal_type = (packet[index + 3] >> 1) & 0x3F
+        if nal_type < 32:  # first VCL NAL unit of the access unit
+            if not 16 <= nal_type <= 21:
+                return packet
+            cut = index - 1 if index > 0 and packet[index - 1] == 0 else index
+            return packet[:cut] + sei + packet[cut:]
+        index = packet.find(b"\x00\x00\x01", index + 3)
+    return packet
+
+
+def cll_sei_values(measured_cll: float, measured_fall: float,
+                   placeholder: tuple[int, int]) -> tuple[int, int] | None:
+    """The MaxCLL/MaxFALL to write over `placeholder`, or None if no value fits in place.
+
+    Rounded up, clamped to 1..65535, MaxFALL <= MaxCLL. The patch overwrites bytes in
+    place, so the escaped NAL must be exactly as long as the placeholder's. Where emulation
+    prevention changes the length (MaxCLL 512 / MaxFALL 3 is 02 00 00 03, which gains a
+    03), MaxCLL is nudged up one nit at a time: far below the measurement's own precision.
+    """
+    target = len(_cll_sei_nal(*placeholder))
+    cll = min(max(math.ceil(measured_cll), 1), 65535)
+    fall = min(max(math.ceil(measured_fall), 1), cll)
+    for _ in range(8):
+        if len(_cll_sei_nal(cll, fall)) == target:
+            return cll, fall
+        if cll == 65535:
+            break
+        cll += 1
+    return None
+
+
+def patch_cll_sei(paths, hdr: HdrSettings, measured_cll: float, measured_fall: float,
+                  expected: int) -> tuple[int, int] | None:
+    """Overwrite the placeholder CLL SEI in local mp4 intermediates with measured values.
+
+    The encode wrote `hdr.max_cll`/`hdr.max_fall` into every IRAP's CLL SEI before the
+    light levels were known. In an mp4 the NAL unit is length-prefixed, so the search
+    pattern is the 4-byte big-endian length plus the escaped NAL. Every file is scanned
+    first; only if the total number of matches equals `expected` (the SEIs actually
+    inserted) is anything written, at the same offsets and the same length. Returns the
+    written (MaxCLL, MaxFALL), or None after a WARNING, with the files untouched and the
+    placeholder values still in them. Never raises for a refusal: the job still succeeds.
+    """
+    placeholder = (hdr.max_cll, hdr.max_fall)
+
+    def refuse(cause: str) -> None:
+        print(
+            f"WARNING: HDR10 MaxCLL/MaxFALL not patched ({cause}); the output keeps the "
+            f"static placeholder {placeholder[0]}/{placeholder[1]} nits instead of the measured "
+            "values. Pass max_cll explicitly to choose them."
+        )
+
+    values = cll_sei_values(measured_cll, measured_fall, placeholder)
+    if values is None:
+        refuse(f"no value near {measured_cll:.1f}/{measured_fall:.1f} keeps the SEI length")
+        return None
+    old = _cll_sei_nal(*placeholder)[len(_ANNEXB_START):]
+    new = _cll_sei_nal(*values)[len(_ANNEXB_START):]
+    if len(old) != len(new):  # cll_sei_values guarantees this; never write otherwise
+        refuse("escaped SEI lengths differ")
+        return None
+    pattern = struct.pack(">I", len(old)) + old
+    replacement = struct.pack(">I", len(new)) + new
+    if expected <= 0:
+        refuse("no CLL SEI was inserted during the encode")
+        return None
+
+    hits: list[tuple[str, list[int]]] = []
+    for path in paths:
+        offsets: list[int] = []
+        try:
+            with open(path, "rb") as handle, mmap.mmap(
+                handle.fileno(), 0, access=mmap.ACCESS_READ
+            ) as view:
+                at = view.find(pattern)
+                while at != -1:
+                    offsets.append(at)
+                    at = view.find(pattern, at + len(pattern))
+        except (OSError, ValueError) as exc:  # ValueError: mmap of an empty file
+            refuse(f"cannot scan {Path(path).name}: {exc}")
+            return None
+        hits.append((os.fspath(path), offsets))
+    found = sum(len(offsets) for _, offsets in hits)
+    if found != expected:
+        refuse(f"found {found} placeholder CLL SEIs in the intermediates, expected {expected}")
+        return None
+
+    if replacement != pattern:
+        for path, offsets in hits:
+            if not offsets:
+                continue
+            fd = os.open(path, os.O_RDWR)
+            try:
+                for at in offsets:
+                    os.pwrite(fd, replacement, at)
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+    return values
+
+
+SDR_VUI_BSF = ("hevc_metadata=colour_primaries=1:transfer_characteristics=1"
+               ":matrix_coefficients=1:video_full_range_flag=0")
+# chroma_sample_loc_type=2 (top-left) is what _hdr10_to_p010 actually samples, unlike
+# NVEncC, which signals 2 from --chromaloc 2 while its 4:2:0 kernel samples type 0.
+HDR_VUI_BSF = ("hevc_metadata=colour_primaries=9:transfer_characteristics=16"
+               ":matrix_coefficients=9:video_full_range_flag=0:chroma_sample_loc_type=2")
+
+
+def _remux_color_args(hdr: HdrSettings | None) -> list[str]:
+    """Colour signalling for the final `-c:v copy` remux.
+
+    NVENC writes no colour description, so hevc_metadata rewrites the SPS VUI. HDR also
+    sets the output stream's colour fields, which is what makes the mp4 muxer write a
+    `colr` (nclx) box -- hevc_metadata alone edits only the bitstream, and players that
+    trust the container would treat the file as SDR. The SDR arguments are the old ones exactly, so
+    this remux leaves SDR output as it was. This copy remux has no way to attach the side data
+    ffmpeg's mp4 muxer would need for `mdcv`/`clli` boxes; the in-band SEI carries them, as it
+    does in NVEncC's output.
+    """
+    if hdr is None:
+        return ["-bsf:v", SDR_VUI_BSF]
+    return [
+        "-bsf:v", HDR_VUI_BSF,
+        "-color_primaries", "bt2020", "-color_trc", "smpte2084",
+        "-colorspace", "bt2020nc", "-color_range", "tv",
+    ]
+
+
 def _aligned_dimension(size: int) -> int:
     return max(8, round(size / 8) * 8)
 
@@ -356,32 +698,50 @@ def plan_dimensions(
 
 
 
-def _check_frame_integrity(
-    input_frame,
-    output_frame,
-    out_width: int,
-    out_height: int,
-) -> None:
+def _integrity_stats(input_frame, output_frame, valid=None):
+    """[valid, 3 input channel means, 3 output channel means] as one CUDA tensor.
+
+    Kept on the GPU so a frame's checks cost one device->host read in total
+    (_check_frame_integrity): each .item() is a host sync, and the four segment threads
+    share the legacy stream. `valid` defaults to "output is finite"; TrueHDR passes its
+    alpha check, since its integer codes cannot be NaN.
+    """
     import torch
 
-    if not torch.isfinite(output_frame).all():
-        raise OutputIntegrityError(
-            f"Super-resolution produced non-finite values (NaN or Inf) at {out_width}x{out_height}."
-        )
+    if valid is None:
+        valid = torch.isfinite(output_frame).all()
+    return torch.cat([
+        valid.reshape(1).to(torch.float32),
+        input_frame.float().mean(dim=(-2, -1))[:3],
+        output_frame.float().mean(dim=(-2, -1))[:3],
+    ])
 
-    in_means = input_frame.float().mean(dim=(-2, -1))
-    out_means = output_frame.float().mean(dim=(-2, -1))
 
+def _check_frame_integrity(stats, out_width: int, out_height: int,
+                           stage: str = "Super-resolution") -> None:
+    """Raise on non-finite output or a collapsed channel; `stats` from _integrity_stats.
+
+    `stats` may hold several stages' 7-value blocks back to back (VSR, then TrueHDR),
+    read back in one transfer; `stage` then names them in order, separated by "+".
+    """
+    import torch
+
+    values = stats.tolist() if torch.is_tensor(stats) else list(stats)
+    stages = stage.split("+")
     channel_names = ["Red", "Green", "Blue"]
-    for c in range(min(3, in_means.shape[0])):
-        in_m = in_means[c].item()
-        out_m = out_means[c].item()
-        if in_m >= 0.01 and (out_m < 0.001 or out_m / (in_m + 1e-7) < 0.01):
-            ch_name = channel_names[c] if c < len(channel_names) else f"Channel {c}"
-            raise OutputIntegrityError(
-                f"Super-resolution output corrupt: {ch_name} channel collapsed "
-                f"(input mean {in_m:.4f}, output mean {out_m:.4f}) at {out_width}x{out_height}."
-            )
+    for block, name in enumerate(stages):
+        valid, *means = values[7 * block:7 * block + 7]
+        if not valid:
+            what = "invalid RGB10A2 words (alpha bits not 3)" if name == "TrueHDR" else \
+                "non-finite values (NaN or Inf)"
+            raise OutputIntegrityError(f"{name} produced {what} at {out_width}x{out_height}.")
+        for c in range(3):
+            in_m, out_m = means[c], means[3 + c]
+            if in_m >= 0.01 and (out_m < 0.001 or out_m / (in_m + 1e-7) < 0.01):
+                raise OutputIntegrityError(
+                    f"{name} output corrupt: {channel_names[c]} channel collapsed "
+                    f"(input mean {in_m:.4f}, output mean {out_m:.4f}) at {out_width}x{out_height}."
+                )
 
 
 def _batch_size_for_output(output_width: int, output_height: int) -> int:
@@ -632,6 +992,140 @@ def _rgb_to_p010(rgb):
     return (packed * 64).to(torch.uint16)
 
 
+# Packed R10G10B10A2 words (nvvfx RGB10A2 and TrueHDR output; also ffmpeg's x2bgr10le):
+# R in bits 0-9, G 10-19, B 20-29, alpha 30-31. torch has few uint32 ops on CUDA, so the
+# bit work runs on an int32 view: alpha=3 sets the sign bit, which the masks drop again.
+RGB10A2_ALPHA = -0x40000000  # 3 << 30 as int32
+
+
+def _unpack_rgb10a2(packed):
+    """(H,W) uint32 RGB10A2 CUDA tensor -> (3,H,W) float32 in [0,1] (code / 1023)."""
+    import torch
+
+    words = packed.view(torch.int32)
+    channels = [(words >> shift) & 0x3FF for shift in (0, 10, 20)]
+    return torch.stack(channels).to(torch.float32).div_(1023.0)
+
+
+def _rgb10a2_alpha_ok(packed):
+    """0-d CUDA bool tensor: every word carries alpha 3 (a wrong layout fails loudly)."""
+    import torch
+
+    return (((packed.view(torch.int32) >> 30) & 3) == 3).all()
+
+
+def _pq_nits_table(device):
+    """1024-entry ST 2084 EOTF: full-range 10-bit PQ code -> cd/m2."""
+    import torch
+
+    m1, m2 = 2610 / 16384, 2523 / 4096 * 128
+    c1, c2, c3 = 3424 / 4096, 2413 / 4096 * 32, 2392 / 4096 * 32
+    e = torch.arange(1024, dtype=torch.float64) / 1023.0
+    p = e.pow(1 / m2)
+    nits = 10000.0 * ((p - c1).clamp(min=0) / (c2 - c3 * p)).pow(1 / m1)
+    return nits.to(torch.float32).to(device)
+
+
+class _HdrLightLevels:
+    """Running MaxCLL / MaxFALL of the encoded frames, kept on the GPU (no host syncs).
+
+    One instance per worker thread; the totals are combined after the threads finish,
+    because four threads updating one tensor could lose updates.
+    """
+
+    def __init__(self, device) -> None:
+        import torch
+
+        self.table = _pq_nits_table(device)
+        self.max_code = torch.zeros((), dtype=torch.int32, device=device)
+        self.max_fall = torch.zeros((), dtype=torch.float32, device=device)
+
+    def update(self, red, green, blue) -> None:
+        """One frame's (H,W) int32 PQ code planes."""
+        import torch
+
+        brightest = torch.maximum(torch.maximum(red, green), blue)
+        torch.maximum(self.max_code, brightest.amax(), out=self.max_code)
+        torch.maximum(self.max_fall, self.table[brightest].mean(), out=self.max_fall)
+
+    @staticmethod
+    def combine(levels: list["_HdrLightLevels"]) -> tuple[float, float]:
+        """(MaxCLL, MaxFALL) in nits across all threads."""
+        if not levels:
+            return 0.0, 0.0
+        table = levels[0].table
+        cll = max(float(table[level.max_code]) for level in levels)
+        fall = max(float(level.max_fall) for level in levels)
+        return cll, fall
+
+
+def _signal_light_levels(hdr: HdrSettings, levels: list[_HdrLightLevels], paths,
+                         expected_sei: int) -> None:
+    """Combine the measured MaxCLL/MaxFALL, patch them into the intermediates, log both.
+
+    Runs after every frame is encoded and before the final remux. With an explicit max_cll
+    the stream already carries those values and nothing is patched. All segments get the
+    same whole-job values.
+    """
+    cll, fall = _HdrLightLevels.combine(levels)
+    written: tuple[int, int] | None = (hdr.max_cll, hdr.max_fall)
+    source = "explicit max_cll"
+    if hdr.measure_cll:
+        if not levels:
+            print(
+                "WARNING: HDR10 light levels were not measured; the output keeps the static "
+                f"placeholder MaxCLL/MaxFALL {hdr.max_cll}/{hdr.max_fall} nits."
+            )
+            written = None
+        else:
+            written = patch_cll_sei(paths, hdr, cll, fall, expected_sei)
+        source = "measured" if written else "static fallback"
+        written = written or (hdr.max_cll, hdr.max_fall)
+    print(
+        f"HDR10 light levels: measured MaxCLL/MaxFALL {cll:.1f}/{fall:.1f} nits; "
+        f"written {written[0]}/{written[1]} ({source})."
+    )
+
+
+def _hdr10_to_p010(packed, levels: "_HdrLightLevels | None" = None):
+    """TrueHDR output -> P010 for NVENC: BT.2020 non-constant luminance, limited range.
+
+    `packed` is (H,W) uint32 RGB10A2 holding full-range 10-bit PQ codes in BT.2020
+    primaries (black = 0, white = the luminance setting). 4:2:0 chroma is sited top-left
+    (chroma_sample_loc_type 2, signalled in the VUI): a [1,2,1]/4 filter in both axes,
+    centred on the even rows and columns, edges replicated. The filter is built from
+    slices and adds rather than conv2d, so the result cannot depend on a cuDNN algorithm
+    choice and stays byte-identical run to run.
+    """
+    import torch
+    import torch.nn.functional as F
+
+    # int32 planes throughout: an int64 stack of a 4K frame alone was ~200 MB of traffic.
+    words = packed.view(torch.int32)
+    codes = [(words >> shift) & 0x3FF for shift in (0, 10, 20)]
+    if levels is not None:
+        levels.update(*codes)
+    r, g, b = (plane.to(torch.float32).div_(1023.0) for plane in codes)
+    y = 0.2627 * r + 0.6780 * g + 0.0593 * b
+    cb = (b - y) / 1.8814
+    cr = (r - y) / 1.4746
+
+    height, width = y.shape
+    chroma = F.pad(torch.stack([cb, cr]).unsqueeze(0), (1, 1, 1, 1), mode="replicate")[0]
+    across = chroma[:, :, 0:width:2] + 2 * chroma[:, :, 1:width + 1:2] + chroma[:, :, 2:width + 2:2]
+    sited = (across[:, 0:height:2] + 2 * across[:, 1:height + 1:2] + across[:, 2:height + 2:2]) / 16
+
+    y10 = (64.0 + 876.0 * y).round().clamp(0, 1023)
+    c10 = (512.0 + 896.0 * sited).round().clamp(0, 1023)
+    # torch has no uint16 left-shift on CUDA, so scale by 64 (<<6) in int32 and cast last.
+    out = torch.empty((height * 3 // 2, width), dtype=torch.int32, device=packed.device)
+    out[:height] = y10.to(torch.int32)
+    uv = out[height:].view(height // 2, width // 2, 2)
+    uv[..., 0] = c10[0].to(torch.int32)
+    uv[..., 1] = c10[1].to(torch.int32)
+    return (out * 64).to(torch.uint16)
+
+
 # ffprobe colour_space values -> swscale in_color_matrix names.
 _SWS_MATRIX = {
     "bt709": "bt709", "smpte170m": "smpte170m", "bt470bg": "bt470",
@@ -641,11 +1135,12 @@ INTERLACED_FIELD_ORDERS = frozenset({"tt", "bb", "tb", "bt"})
 
 
 def _probe_decode_hints(input_path: str) -> dict[str, str]:
-    """field_order, color_space, color_range and height of the first video stream."""
+    """field_order, colour tags, pix_fmt and height of the first video stream."""
     result = subprocess.run(
         [
             "ffprobe", "-v", "error", "-select_streams", "v:0",
-            "-show_entries", "stream=field_order,color_space,color_range,height",
+            "-show_entries",
+            "stream=field_order,color_space,color_range,color_transfer,pix_fmt,height",
             "-of", "default=noprint_wrappers=1", input_path,
         ],
         capture_output=True, text=True, check=False,
@@ -657,13 +1152,36 @@ def _probe_decode_hints(input_path: str) -> dict[str, str]:
     return hints
 
 
+HDR_TRANSFERS = frozenset({"smpte2084", "arib-std-b67"})
+
+
+def _is_hdr_source(hints: dict[str, str]) -> bool:
+    """PQ or HLG transfer: already HDR, so TrueHDR (an SDR->HDR model) must not run."""
+    return hints.get("color_transfer", "") in HDR_TRANSFERS
+
+
+def _is_ten_bit_sdr(hints: dict[str, str]) -> bool:
+    """An SDR source with 10 or more bits per sample (yuv420p10le, p010le, ...).
+
+    Those decode as x2bgr10le and run VSR in RGB10A2, so the extra bits reach VSR instead
+    of being rounded to 8 at decode. HDR sources keep the 8-bit path they always had.
+    """
+    pix_fmt = hints.get("pix_fmt", "")
+    deep = re.search(r"p0(1[0-6])|(?:9|1[0-6])(?:le|be)$", pix_fmt) is not None
+    return deep and not _is_hdr_source(hints)
+
+
 def _ffmpeg_decode_command(
     input_path: str,
     use_nvdec: bool,
     segment: "VideoSegment | None" = None,
     pts_log: str | None = None,
+    pix_fmt: str = "rgb24",
 ) -> list[str]:
     """rawvideo rgb24 decode of the whole input, or of one segment of it.
+
+    `pix_fmt="x2bgr10le"` keeps 10-bit sources at 10 bits: one little-endian word per
+    pixel, R in bits 0-9, G 10-19, B 20-29, alpha 3 -- exactly nvvfx's RGB10A2 layout.
 
     A segment seeks to the keyframe at or before its start (input -ss, which is relative
     to the container's start_time -- with an absolute time MPEG-TS lost 254 of 1526
@@ -719,7 +1237,7 @@ def _ffmpeg_decode_command(
         "-vf", f"{trim}scale=in_color_matrix={matrix}:in_range={in_range}"
                ":flags=bicubic+accurate_rnd+full_chroma_int",
         *stats,
-        "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1",
+        "-f", "rawvideo", "-pix_fmt", pix_fmt, "pipe:1",
     ]
 
 
@@ -824,7 +1342,7 @@ class _SegmentDecoder:
     """
 
     def __init__(self, input_path: str, use_nvdec: bool, segment: VideoSegment,
-                 frame_bytes: int, scratch_dir: Path) -> None:
+                 frame_bytes: int, scratch_dir: Path, pix_fmt: str = "rgb24") -> None:
         self.segment = segment
         self.frame_bytes = frame_bytes
         self.stop = threading.Event()
@@ -833,7 +1351,9 @@ class _SegmentDecoder:
         self.log_handle = open(self.log_path, "wb")
         try:
             self.proc = subprocess.Popen(
-                _ffmpeg_decode_command(input_path, use_nvdec, segment, self.pts_log.as_posix()),
+                _ffmpeg_decode_command(
+                    input_path, use_nvdec, segment, self.pts_log.as_posix(), pix_fmt
+                ),
                 stdout=subprocess.PIPE,
                 stderr=self.log_handle,
             )
@@ -1074,8 +1594,9 @@ class UpscaleWorker:
             f"level={NVENC_LEVEL}, maxrate={NVENC_MAX_MBPS}M, "
             f"refs={NVENC_REFS if self.encoder_refs else 'default'})"
         )
-        # Cached effect instances keyed by (thread, role) -> (quality, out_w, out_h). Two
-        # roles exist: the upscale pass, and the optional same-resolution preprocess pass.
+        # Cached effect instances keyed by (thread, role) -> (settings key, effect). Three
+        # roles exist: the upscale pass, the optional same-resolution preprocess pass, and
+        # TrueHDR for HDR10 output.
         #
         # The cache is per *thread*, not per container, because Modal runs concurrent
         # inputs as separate threads sharing one instance. An nvvfx effect must not be
@@ -1084,7 +1605,7 @@ class UpscaleWorker:
         # _upscale_rgb_batch guards against). Two jobs sharing one effect would interleave
         # into each other's output. Per-thread instances keep the reuse benefit without
         # the race.
-        self._sr_cache: dict[tuple[int, str], tuple[tuple[str, int, int], object]] = {}
+        self._sr_cache: dict[tuple[int, str], tuple[tuple, object]] = {}
         self._sr_stacks: dict[int, contextlib.ExitStack] = {}
         self._sr_lock = threading.Lock()
         # Serializes Volume reload/commit across concurrent inputs (see run()).
@@ -1114,12 +1635,18 @@ class UpscaleWorker:
         for stack in stacks:
             stack.close()
 
-    def _super_res(self, quality: str, output_width: int, output_height: int, role: str = "upscale"):
-        """Reuse the loaded model when consecutive jobs share quality and output size."""
+    def _super_res(self, quality: str, output_width: int, output_height: int,
+                   role: str = "upscale", input_size: tuple[int, int] | None = None):
+        """Reuse the loaded model when consecutive jobs share quality and output size.
+
+        `input_size` selects the RGB10A2 image encoding (10-bit sources, packed (H,W)
+        uint32 in and out); None keeps the float RGB8 interface. The encoding is part of
+        the cache key, so an 8-bit job never reuses a 10-bit effect or the reverse.
+        """
         import nvvfx
 
         normalized_quality = _normalize_quality(quality)
-        key = (normalized_quality, output_width, output_height)
+        key = (normalized_quality, output_width, output_height, input_size)
         cache_key = (threading.get_ident(), role)
         cached = self._sr_cache.get(cache_key)
         if cached is not None and cached[0] == key:
@@ -1133,16 +1660,22 @@ class UpscaleWorker:
         with self._sr_lock:
             stack = self._sr_stacks.setdefault(cache_key[0], contextlib.ExitStack())
 
-        sr = stack.enter_context(
-            nvvfx.VideoSuperRes(getattr(nvvfx.VideoSuperRes.QualityLevel, normalized_quality))
-        )
+        quality_level = getattr(nvvfx.VideoSuperRes.QualityLevel, normalized_quality)
+        if input_size is None:
+            sr = stack.enter_context(nvvfx.VideoSuperRes(quality_level))
+        else:
+            sr = stack.enter_context(nvvfx.VideoSuperRes(
+                quality_level, image_encoding=nvvfx.VideoSuperRes.ImageEncoding.RGB10A2,
+            ))
+            sr.input_width, sr.input_height = input_size
         sr.output_width = output_width
         sr.output_height = output_height
         sr.load()
         self._sr_cache[cache_key] = (key, sr)
         return sr
 
-    def _preprocess_effect(self, preprocess: str | None, input_width: int, input_height: int):
+    def _preprocess_effect(self, preprocess: str | None, input_width: int, input_height: int,
+                           ten_bit: bool = False):
         """Optional same-resolution restoration pass applied before upscaling.
 
         DENOISE/DEBLUR run at the input's own size, so the effect's output dimensions
@@ -1159,15 +1692,72 @@ class UpscaleWorker:
         if not getattr(self, "_logged_preprocess", False):
             print(f"Preprocess pass active: {normalized} at {input_width}x{input_height}.")
             self._logged_preprocess = True
-        return self._super_res(normalized, input_width, input_height, role="preprocess")
+        return self._super_res(
+            normalized, input_width, input_height, role="preprocess",
+            input_size=(input_width, input_height) if ten_bit else None,
+        )
+
+    def _true_hdr(self, hdr: HdrSettings, output_width: int, output_height: int):
+        """This thread's TrueHDR effect for `hdr`, warmed up at the output size.
+
+        Cached per thread like the VSR effects (an effect is not reentrant and reuses its
+        DLPack output buffer). TrueHDR infers its size on the first run(), not at load(),
+        so a warm-up run at the job's output size happens here -- before CreateEncoder,
+        the same ordering that fixed error 8 after an effect changed size (see
+        _upscale_video_gpu). Any change of settings or size rebuilds the effect (load is
+        ~0.3 s): reusing one effect across output sizes was never probed.
+        """
+        import nvvfx
+        import torch
+
+        key = (hdr, output_width, output_height)
+        cache_key = (threading.get_ident(), "truehdr")
+        cached = self._sr_cache.get(cache_key)
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        if cached is not None:
+            with contextlib.suppress(Exception):
+                cached[1].close()
+        with self._sr_lock:
+            stack = self._sr_stacks.setdefault(cache_key[0], contextlib.ExitStack())
+        effect = stack.enter_context(nvvfx.TrueHDR(
+            contrast=hdr.contrast, saturation=hdr.saturation, middle_gray=hdr.middle_gray,
+            luminance=hdr.luminance, debanding_off=0 if hdr.debanding else 1,
+        ))
+        effect.load()
+        warm = torch.zeros((3, output_height, output_width), dtype=torch.float32, device="cuda")
+        warmed = torch.from_dlpack(effect.run(warm).image).clone()
+        torch.cuda.synchronize()
+        if tuple(warmed.shape) != (output_height, output_width):
+            raise OutputIntegrityError(
+                f"TrueHDR returned {tuple(warmed.shape)} for a {output_width}x{output_height} frame."
+            )
+        self._sr_cache[cache_key] = (key, effect)
+        return effect
 
     def _upscale_rgb_batch(self, sr, rgb_frames, plan: PlannedDimensions, pre=None,
-                           keep_on_gpu: bool = False):
+                           keep_on_gpu: bool = False, hdr=None):
+        """Preprocess, VSR, integrity check and hybrid resize for a batch of frames.
+
+        Frames are (H,W,3) uint8 (host arrays, or CUDA tensors from in-process NVDEC), or
+        (H,W) int32 host arrays of x2bgr10le words for 10-bit sources, which run the
+        effects in RGB10A2 and come back as float with 10-bit precision.
+
+        Returns (H,W,3) float [0,1] CUDA tensors (keep_on_gpu) or uint8 arrays -- or,
+        when `hdr` (a TrueHDR effect) is given, (H,W) uint32 RGB10A2 CUDA tensors of
+        full-range BT.2020 PQ codes for _hdr10_to_p010.
+        """
         import numpy as np
         import torch
         import torch.nn.functional as F
 
-        if torch.is_tensor(rgb_frames[0]):
+        ten_bit = rgb_frames[0].ndim == 2
+        if ten_bit:
+            # x2bgr10le words are nvvfx's RGB10A2 layout; set the alpha bits it expects
+            # (swscale writes 3 already, but the effect must never see anything else).
+            batch_cuda = (torch.from_numpy(np.stack(rgb_frames, axis=0)).cuda()
+                          | RGB10A2_ALPHA).view(torch.uint32)
+        elif torch.is_tensor(rgb_frames[0]):
             # NVDEC decoded these straight into CUDA memory, so there is nothing to upload.
             batch_cuda = (
                 torch.stack(rgb_frames, dim=0)
@@ -1203,13 +1793,22 @@ class UpscaleWorker:
                 # Same-resolution restoration pass. The SDK reuses its DLPack buffer, so
                 # this clone is as mandatory as the one below.
                 inp_frame = torch.from_dlpack(pre.run(inp_frame).image).clone()
+                if ten_bit:
+                    # DENOISE/DEBLUR in RGB10A2 return words without alpha 3 (probed
+                    # 2026-10-04); restore it before the upscale pass reads them.
+                    inp_frame = (inp_frame.view(torch.int32) | RGB10A2_ALPHA).view(torch.uint32)
             dlpack_out = sr.run(inp_frame).image
             # The NVIDIA VFX SDK reuses its internal DLPack output buffer on the next call.
             # We must explicitly clone the tensor to PyTorch memory before subsequent SDK operations.
             sr_tensor = torch.from_dlpack(dlpack_out).clone()
+            if ten_bit:
+                inp_frame = _unpack_rgb10a2(inp_frame)
+                sr_tensor = _unpack_rgb10a2(sr_tensor)
 
-            # Output integrity check (NaN/Inf and channel collapse)
-            _check_frame_integrity(inp_frame, sr_tensor, plan.sr_width, plan.sr_height)
+            # Output integrity check (NaN/Inf and channel collapse). The numbers stay on the
+            # GPU until the one read-back below, after TrueHDR has run too.
+            stats = [_integrity_stats(inp_frame, sr_tensor)]
+            stages = "Super-resolution"
 
             if plan.is_hybrid:
                 out_tensor = F.interpolate(
@@ -1221,7 +1820,32 @@ class UpscaleWorker:
             else:
                 out_tensor = sr_tensor
 
-            out_clamped = out_tensor.movedim(0, -1).clamp(0.0, 1.0)
+            out_clamped = out_tensor.clamp(0.0, 1.0)
+            if hdr is not None:
+                # SDR -> HDR10 at output size, after VSR: the order NVEncC uses. VSR run on
+                # PQ data instead overshot highlights (code 720 -> 900, ~650 -> 3200 nits).
+                # TrueHDR reuses its DLPack output buffer like VSR, so the clone is
+                # mandatory here too.
+                hdr_frame = torch.from_dlpack(hdr.run(out_clamped.contiguous()).image).clone()
+                if hdr_frame.shape != out_clamped.shape[1:]:
+                    raise OutputIntegrityError(
+                        f"TrueHDR returned {tuple(hdr_frame.shape)} for a "
+                        f"{tuple(out_clamped.shape[1:])} frame."
+                    )
+                # Checked on a 1/16 subsample: a collapsed channel or a wrong word layout
+                # shows in any 4x4 grid, and every full-frame pass here is GPU time that the
+                # four segment threads' device-wide syncs all wait on.
+                sample = hdr_frame[::4, ::4]
+                stats.append(_integrity_stats(
+                    out_clamped[:, ::4, ::4], _unpack_rgb10a2(sample), valid=_rgb10a2_alpha_ok(sample),
+                ))
+                stages += "+TrueHDR"
+            _check_frame_integrity(torch.cat(stats), plan.sr_width, plan.sr_height, stages)
+
+            if hdr is not None:
+                outputs.append(hdr_frame)
+                continue
+            out_clamped = out_clamped.movedim(0, -1)
             if keep_on_gpu:
                 # The GPU encoder path converts to P010 on-device, so the 24.9 MB/frame
                 # download that dominates the piped path never happens.
@@ -1283,6 +1907,7 @@ class UpscaleWorker:
         keep_aspect_ratio: bool = True,
         preprocess: str | None = None,
         scratch_dir: Path | None = None,
+        hdr: HdrSettings | None = None,
     ) -> tuple[str, str]:
         """GPU-resident output path: VSR result goes to NVENC without touching the host.
 
@@ -1323,7 +1948,9 @@ class UpscaleWorker:
             keep_aspect_ratio=keep_aspect_ratio,
         )
         batch_limit = _batch_size_for_output(plan.output_width, plan.output_height)
-        frame_bytes = in_width * in_height * 3
+        hints = _probe_decode_hints(input_path.as_posix())
+        ten_bit = _is_ten_bit_sdr(hints)
+        frame_bytes = in_width * in_height * (4 if ten_bit else 3)
 
         # Only consulted if the in-process decoder below is unavailable; the warning is
         # deferred until we know we actually need the piped decoder.
@@ -1334,8 +1961,13 @@ class UpscaleWorker:
         # 4K job before an 8K one), CreateEncoder with an explicit level at P5+fullres
         # failed nvEncInitializeEncoder with error 8 -- every video job after an image
         # job in production, 2026-10-03. Swapping the effect first avoids that state.
-        sr = self._super_res(quality, plan.sr_width, plan.sr_height)
-        pre = self._preprocess_effect(preprocess, in_width, in_height)
+        sr = self._super_res(quality, plan.sr_width, plan.sr_height,
+                             input_size=(in_width, in_height) if ten_bit else None)
+        pre = self._preprocess_effect(preprocess, in_width, in_height, ten_bit)
+        # TrueHDR too: its warm-up run at the output size is part of the effect swap.
+        thdr = self._true_hdr(hdr, plan.output_width, plan.output_height) if hdr else None
+        sei = hdr10_sei_nals(hdr) if hdr else b""
+        levels = _HdrLightLevels("cuda") if hdr else None
 
         # Settings, level policy, error-8 retries and the bitrate ceiling all live in the
         # shared factory, so this path and the parallel one cannot drift apart.
@@ -1368,7 +2000,7 @@ class UpscaleWorker:
         # ffmpeg's NVDEC path weaves instead (lossless for PsF), so route those inputs to
         # the piped decoder. Truly interlaced (50i/60i) video would want a real
         # deinterlacer such as bwdif ahead of VSR; that is not handled here.
-        field_order = _probe_decode_hints(input_path.as_posix()).get("field_order", "")
+        field_order = hints.get("field_order", "")
         interlaced = field_order in INTERLACED_FIELD_ORDERS
         if interlaced and GPU_DECODER and use_nvdec:
             print(
@@ -1376,8 +2008,13 @@ class UpscaleWorker:
                 "in-process NVDEC would apply Adaptive deinterlacing and soften vertical "
                 "detail, so decoding through ffmpeg NVDEC (woven) instead."
             )
+        if ten_bit and GPU_DECODER and use_nvdec:
+            print(
+                f"10-bit source ({hints.get('pix_fmt')}): decoding through ffmpeg NVDEC as "
+                "x2bgr10le so VSR sees all 10 bits; in-process NVDEC delivers 8-bit RGB only."
+            )
         gpu_decoder = None
-        if GPU_DECODER and use_nvdec and not interlaced:
+        if GPU_DECODER and use_nvdec and not interlaced and not ten_bit:
             try:
                 demuxer = nvc.CreateDemuxer(filename=input_path.as_posix())
                 gpu_decoder = nvc.CreateDecoder(
@@ -1427,7 +2064,10 @@ class UpscaleWorker:
                 )
             decode_log_handle = open(decode_log_path, "wb")
             decoder_proc = subprocess.Popen(
-                _ffmpeg_decode_command(input_path.as_posix(), use_nvdec),
+                _ffmpeg_decode_command(
+                    input_path.as_posix(), use_nvdec,
+                    pix_fmt="x2bgr10le" if ten_bit else "rgb24",
+                ),
                 stdout=subprocess.PIPE,
                 stderr=decode_log_handle,
             )
@@ -1455,13 +2095,19 @@ class UpscaleWorker:
         encode_seconds = 0.0
         started = time.perf_counter()
         rgb_batch: list = []
+        sei_count = 0  # SEIs actually inserted: what patch_cll_sei must find
 
         def _mux(packets) -> int:
+            nonlocal sei_count
             count = 0
             for packet in packets or []:
-                muxer.MuxVideoPacket(
-                    bytes(packet["data"]), packet["picture_type"], packet["timestamp"]
-                )
+                data = bytes(packet["data"])
+                if sei:
+                    # HDR10 mastering display + MaxCLL on every IRAP, as NVEncC writes them.
+                    size = len(data)
+                    data = insert_sei_before_irap_slice(data, sei)
+                    sei_count += len(data) != size
+                muxer.MuxVideoPacket(data, packet["picture_type"], packet["timestamp"])
                 count += 1
             return count
 
@@ -1472,11 +2118,12 @@ class UpscaleWorker:
             if not rgb_batch:
                 return
             infer_start = time.perf_counter()
-            upscaled = self._upscale_rgb_batch(sr, rgb_batch, plan, pre, keep_on_gpu=True)
+            upscaled = self._upscale_rgb_batch(sr, rgb_batch, plan, pre, keep_on_gpu=True,
+                                               hdr=thdr)
             infer_seconds += time.perf_counter() - infer_start
             encode_start = time.perf_counter()
             for frame_rgb in upscaled:
-                p010 = _rgb_to_p010(frame_rgb)
+                p010 = _hdr10_to_p010(frame_rgb, levels) if hdr else _rgb_to_p010(frame_rgb)
                 # NVENC reads this surface from the encoder ASIC, which takes no part in
                 # CUDA stream ordering: it can start reading before the conversion kernels
                 # above have run. Without this sync it encoded half-written surfaces --
@@ -1510,7 +2157,9 @@ class UpscaleWorker:
                     raise RuntimeError("Video decoding failed.") from item
                 if item is None:
                     return
-                if isinstance(item, bytes):
+                if isinstance(item, bytes) and ten_bit:
+                    yield np.frombuffer(item, dtype="<i4").reshape(in_height, in_width)
+                elif isinstance(item, bytes):
                     yield np.frombuffer(item, dtype=np.uint8).reshape(
                         in_height, in_width, 3
                     )
@@ -1559,18 +2208,20 @@ class UpscaleWorker:
                 f"Encoder returned {packet_count} packets for {frame_count} frames; "
                 "output would be missing frames."
             )
+        if levels is not None:
+            # Measured MaxCLL/MaxFALL into the local intermediate, before the copy remux.
+            _signal_light_levels(hdr, [levels], [video_only_path], sei_count)
 
-        # Remux to attach audio and write the bt709 VUI. NVENC does not tag colour itself,
-        # and CLAUDE.md requires all three fields to read bt709. The input here is an mp4
-        # with real timestamps, so unlike a raw elementary stream this remux is lossless.
+        # Remux to attach audio and write the colour VUI (bt709, or BT.2020/PQ for HDR10).
+        # NVENC does not tag colour itself, and CLAUDE.md requires all three fields to be
+        # set. The input here is an mp4 with real timestamps, so unlike a raw elementary
+        # stream this remux is lossless.
         mux_command = [
             "ffmpeg", "-y", "-loglevel", "error",
             "-i", video_only_path.as_posix(),
             "-i", input_path.as_posix(),
             "-map", "0:v:0", *_audio_args(input_path.as_posix()),
-            "-c:v", "copy",
-            "-bsf:v", "hevc_metadata=colour_primaries=1:transfer_characteristics=1"
-                      ":matrix_coefficients=1:video_full_range_flag=0",
+            "-c:v", "copy", *_remux_color_args(hdr),
             "-movflags", "+faststart", output_path.as_posix(),
         ]
         result = subprocess.run(mux_command, capture_output=True, text=True)
@@ -1586,7 +2237,8 @@ class UpscaleWorker:
             f"infer {100 * infer_seconds / elapsed:.0f}%, "
             f"encode {100 * encode_seconds / elapsed:.0f}%; "
             f"nvdec={'in-process' if gpu_decoder is not None else ('yes' if use_nvdec else 'no')}, "
-            f"batch={batch_limit}, gpu-encoder=yes)"
+            f"batch={batch_limit}, gpu-encoder=yes{', 10-bit' if ten_bit else ''}"
+            f"{', hdr=' + hdr.describe() if hdr else ''})"
         )
         return output_name, "video/mp4"
 
@@ -1604,6 +2256,7 @@ class UpscaleWorker:
         keep_aspect_ratio: bool = True,
         preprocess: str | None = None,
         scratch_dir: Path | None = None,
+        hdr: HdrSettings | None = None,
     ) -> tuple[str, str]:
         """Parallel NVENC sessions over keyframe-aligned segments (see NVENC_SESSIONS).
 
@@ -1641,7 +2294,10 @@ class UpscaleWorker:
             keep_aspect_ratio=keep_aspect_ratio,
         )
         batch_limit = _batch_size_for_output(plan.output_width, plan.output_height)
-        frame_bytes = in_width * in_height * 3
+        ten_bit = _is_ten_bit_sdr(_probe_decode_hints(input_path.as_posix()))
+        decode_format = "x2bgr10le" if ten_bit else "rgb24"
+        frame_bytes = in_width * in_height * (4 if ten_bit else 3)
+        sei = hdr10_sei_nals(hdr) if hdr else b""
         use_nvdec = _nvdec_can_decode(input_path.as_posix())
         if not use_nvdec:
             print(
@@ -1661,6 +2317,9 @@ class UpscaleWorker:
         segment_paths = [scratch_dir / f"segment-{seg.index:05d}.mp4" for seg in segments]
         stage_seconds = {"decode-wait": 0.0, "infer": 0.0, "encode": 0.0}
         effect_seconds = [0.0] * sessions
+        # MaxCLL/MaxFALL accumulate per worker slot and are combined after the join.
+        light_levels: list = [None] * sessions
+        sei_counts = [0] * sessions  # SEIs inserted per slot, for patch_cll_sei
         stage_lock = threading.Lock()
 
         def worker(slot: int) -> None:
@@ -1670,8 +2329,12 @@ class UpscaleWorker:
                 # Per-thread effects, loaded before any encoder exists (the error-8
                 # mitigation of _upscale_video_gpu, kept for the same reason).
                 effect_start = time.perf_counter()
-                sr = self._super_res(quality, plan.sr_width, plan.sr_height)
-                pre = self._preprocess_effect(preprocess, in_width, in_height)
+                sr = self._super_res(quality, plan.sr_width, plan.sr_height,
+                                     input_size=(in_width, in_height) if ten_bit else None)
+                pre = self._preprocess_effect(preprocess, in_width, in_height, ten_bit)
+                thdr = self._true_hdr(hdr, plan.output_width, plan.output_height) if hdr else None
+                levels = _HdrLightLevels("cuda") if hdr else None
+                light_levels[slot] = levels
                 with stage_lock:
                     effect_seconds[slot] = time.perf_counter() - effect_start
                 # The first segment is this slot's whatever the session count turns out
@@ -1679,6 +2342,7 @@ class UpscaleWorker:
                 # can overlap encoder creation.
                 first = _SegmentDecoder(
                     input_path.as_posix(), use_nvdec, segments[slot], frame_bytes, scratch_dir,
+                    decode_format,
                 )
                 decoders.append(first)
                 loaded[slot].set()
@@ -1701,9 +2365,13 @@ class UpscaleWorker:
                         )
                         if entry is None:
                             raise RuntimeError(f"NVENC returned a packet for unknown input {index}.")
-                        entry[3].MuxVideoPacket(
-                            bytes(packet["data"]), packet["picture_type"], index - entry[1]
-                        )
+                        data = bytes(packet["data"])
+                        if sei:
+                            # HDR10 SEI on every IRAP, including each segment's FORCEIDR.
+                            size = len(data)
+                            data = insert_sei_before_irap_slice(data, sei)
+                            sei_counts[slot] += len(data) != size
+                        entry[3].MuxVideoPacket(data, packet["picture_type"], index - entry[1])
                         entry[4] += 1
                         if entry[2] is not None and entry[4] == entry[2]:
                             entry[3].Finalize()
@@ -1714,6 +2382,7 @@ class UpscaleWorker:
                         return None
                     decoder = _SegmentDecoder(
                         input_path.as_posix(), use_nvdec, mine[position], frame_bytes, scratch_dir,
+                        decode_format,
                     )
                     decoders.append(decoder)
                     return decoder
@@ -1739,11 +2408,13 @@ class UpscaleWorker:
                         if not batch:
                             return
                         infer_start = time.perf_counter()
-                        upscaled = self._upscale_rgb_batch(sr, batch, plan, pre, keep_on_gpu=True)
+                        upscaled = self._upscale_rgb_batch(sr, batch, plan, pre, keep_on_gpu=True,
+                                                           hdr=thdr)
                         infer_seconds += time.perf_counter() - infer_start
                         encode_start = time.perf_counter()
                         for frame_rgb in upscaled:
-                            p010 = _rgb_to_p010(frame_rgb)
+                            p010 = (_hdr10_to_p010(frame_rgb, levels) if hdr
+                                    else _rgb_to_p010(frame_rgb))
                             # The striping fix (see _upscale_video_gpu). A per-thread stream
                             # sync is NOT enough: measured striped (Laplacian 52-85) with
                             # four workers, because nvvfx does not run on our stream.
@@ -1764,6 +2435,8 @@ class UpscaleWorker:
                         if buffer is None:
                             break
                         batch.append(
+                            np.frombuffer(buffer, dtype="<i4").reshape(in_height, in_width)
+                            if ten_bit else
                             np.frombuffer(buffer, dtype=np.uint8).reshape(in_height, in_width, 3)
                         )
                         if len(batch) >= batch_limit:
@@ -1804,7 +2477,8 @@ class UpscaleWorker:
         print(
             f"Segmented encode: {len(segments)} keyframe-aligned segments across {sessions} "
             "NVENC sessions; decoding through ffmpeg"
-            f"{' NVDEC' if use_nvdec else ''} (woven, seek + trim per segment)."
+            f"{' NVDEC' if use_nvdec else ''} (woven, seek + trim per segment)"
+            f"{', as x2bgr10le (10-bit source)' if ten_bit else ''}."
         )
         with self._segment_job_lock:
             started = time.perf_counter()
@@ -1838,20 +2512,25 @@ class UpscaleWorker:
         frame_count = sum(segment_frames)
         if frame_count == 0:
             raise ValueError("Uploaded video has no decodable frames.")
+        if hdr:
+            # Whole-job MaxCLL/MaxFALL, the same in every segment, patched into the local
+            # segment files before the concat remux.
+            _signal_light_levels(
+                hdr, [level for level in light_levels if level is not None],
+                [path for path in segment_paths if path.exists()], sum(sei_counts),
+            )
         list_path = scratch_dir / "segments.txt"
         list_path.write_text(
             "".join(f"file '{path.as_posix()}'\n" for path in segment_paths if path.exists())
         )
         # Joins the segments without re-encoding, then the same remux as
-        # _upscale_video_gpu: audio from the source and the bt709 VUI.
+        # _upscale_video_gpu: audio from the source and the colour VUI.
         mux_command = [
             "ffmpeg", "-y", "-loglevel", "error",
             "-f", "concat", "-safe", "0", "-i", list_path.as_posix(),
             "-i", input_path.as_posix(),
             "-map", "0:v:0", *_audio_args(input_path.as_posix()),
-            "-c:v", "copy",
-            "-bsf:v", "hevc_metadata=colour_primaries=1:transfer_characteristics=1"
-                      ":matrix_coefficients=1:video_full_range_flag=0",
+            "-c:v", "copy", *_remux_color_args(hdr),
             "-movflags", "+faststart", output_path.as_posix(),
         ]
         result = subprocess.run(mux_command, capture_output=True, text=True)
@@ -1872,7 +2551,8 @@ class UpscaleWorker:
             f"decode-wait {100 * stage_seconds['decode-wait'] / worker_seconds:.0f}%, "
             f"infer {100 * stage_seconds['infer'] / worker_seconds:.0f}%, "
             f"encode {100 * stage_seconds['encode'] / worker_seconds:.0f}%; "
-            f"nvdec={'yes' if use_nvdec else 'no'}, batch={batch_limit}, gpu-encoder=yes; "
+            f"nvdec={'yes' if use_nvdec else 'no'}, batch={batch_limit}, gpu-encoder=yes"
+            f"{', 10-bit' if ten_bit else ''}{', hdr=' + hdr.describe() if hdr else ''}; "
             f"peak RSS {resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1048576:.1f} GiB)"
         )
         return output_name, "video/mp4"
@@ -1890,19 +2570,43 @@ class UpscaleWorker:
         keep_aspect_ratio: bool = True,
         preprocess: str | None = None,
         scratch_dir: Path | None = None,
+        hdr: HdrSettings | None = None,
     ) -> tuple[str, str]:
         import numpy as np
 
-        if GPU_ENCODER and self.encoder == "hevc_nvenc":
+        gpu_path = GPU_ENCODER and self.encoder == "hevc_nvenc"
+        if hdr is not None:
+            # Fail before any GPU work rather than hand back SDR, or HDR made from HDR.
+            if not gpu_path:
+                raise HdrRequestError(
+                    "HDR10 request: TrueHDR output needs the GPU encoder path "
+                    f"(encoder={self.encoder}, MODAL_GPU_ENCODER={int(GPU_ENCODER)}); the piped "
+                    "fallback writes SDR only."
+                )
+            hints = _probe_decode_hints(input_path.as_posix())
+            if _is_hdr_source(hints):
+                raise HdrRequestError(
+                    f"HDR10 request: the source is already HDR (color_transfer="
+                    f"{hints.get('color_transfer')}); TrueHDR converts SDR sources only."
+                )
+            in_width, in_height, _ = _probe_video_metadata(input_path.as_posix())
+            plan = plan_dimensions(in_width, in_height, resize_type, scale, width, height,
+                                   keep_aspect_ratio)
+            if plan.output_width * plan.output_height > MAX_HDR_OUTPUT_PIXELS:
+                raise HdrRequestError(
+                    f"HDR10 request: output {plan.output_width}x{plan.output_height} is above "
+                    f"the largest size TrueHDR was verified at ({MAX_HDR_OUTPUT_PIXELS} pixels)."
+                )
+        if gpu_path:
             segments = _plan_segments(input_path.as_posix(), NVENC_SESSIONS)
             if segments is not None:
                 return self._upscale_video_segmented(
                     input_path, output_dir, stem, segments, resize_type, scale, width,
-                    height, quality, keep_aspect_ratio, preprocess, scratch_dir,
+                    height, quality, keep_aspect_ratio, preprocess, scratch_dir, hdr,
                 )
             return self._upscale_video_gpu(
                 input_path, output_dir, stem, resize_type, scale, width, height,
-                quality, keep_aspect_ratio, preprocess, scratch_dir,
+                quality, keep_aspect_ratio, preprocess, scratch_dir, hdr,
             )
 
         output_name = f"{stem}_upscaled.mp4"
@@ -2084,6 +2788,9 @@ class UpscaleWorker:
         quality: str,
         keep_aspect_ratio: bool = True,
         preprocess: str | None = None,
+        truehdr: str = "",
+        master_display: str = "",
+        max_cll: str = "",
     ) -> dict[str, str]:
         self._logged_hybrid = False
         self._logged_preprocess = False
@@ -2117,8 +2824,18 @@ class UpscaleWorker:
         # prerequisite for MODAL_WORKER_CONCURRENCY > 1.
         scratch_dir = Path(tempfile.mkdtemp(prefix=f"rtx-{job_id}-"))
         try:
+            # Plain strings in, parsed here as well as in the web tier, so a direct
+            # run.remote() (scripts/verify_roundtrip.py) gets the same validation.
+            try:
+                hdr = parse_hdr_settings(truehdr, master_display, max_cll)
+            except ValueError as exc:
+                raise HdrRequestError(f"HDR10 request: {exc}") from None
             if _is_video(input_name, mime_type):
-                output_name, media_type = self._upscale_video(*args, scratch_dir=scratch_dir)
+                output_name, media_type = self._upscale_video(
+                    *args, scratch_dir=scratch_dir, hdr=hdr
+                )
+            elif hdr is not None:
+                raise HdrRequestError("HDR10 request: TrueHDR output is for video inputs only.")
             else:
                 output_name, media_type = self._upscale_image(*args)
         except BaseException:
@@ -2179,6 +2896,13 @@ def api():
         # damages texture on sources that are soft but not heavily compressed. See CLAUDE.md.
         quality: str = Form("HIGHBITRATE_ULTRA"),
         preprocess: str = Form(""),
+        # SDR->HDR10 (video only). Empty = SDR output, unchanged. "on" or NVEncC syntax
+        # "contrast=102,saturation=102,middlegray=46,maxluminance=680[,debanding=off]";
+        # master_display / max_cll take NVEncC's --master-display / --max-cll strings.
+        # Empty max_cll = MaxCLL/MaxFALL measured per job and written into the stream.
+        truehdr: str = Form(""),
+        master_display: str = Form(""),
+        max_cll: str = Form(""),
     ):
         try:
             if _normalize_quality(quality) not in UPSCALE_QUALITIES:
@@ -2201,6 +2925,10 @@ def api():
                     raise ValueError(
                         f"Output dimension exceeds maximum supported edge of {MAX_OUTPUT_EDGE} (got {width}x{height})."
                     )
+            if parse_hdr_settings(truehdr, master_display, max_cll) is not None and not _is_video(
+                file.filename or "", file.content_type
+            ):
+                raise ValueError("truehdr (HDR10 output) is for video inputs only.")
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -2230,6 +2958,9 @@ def api():
             quality=quality,
             keep_aspect_ratio=keep_aspect_ratio,
             preprocess=preprocess or None,
+            truehdr=truehdr,
+            master_display=master_display,
+            max_cll=max_cll,
         )
         return {"call_id": call.object_id, "job_id": job_id}
 
@@ -2245,7 +2976,8 @@ def api():
         except Exception as exc:  # noqa: BLE001
             msg = str(exc)
             if (
-                isinstance(exc, (UpscaleOnlyError, OutputDimensionExceededError))
+                isinstance(exc, (UpscaleOnlyError, OutputDimensionExceededError, HdrRequestError))
+                or "HDR10 request:" in msg
                 or "Upscaling only" in msg
                 or "Output dimension exceeds" in msg
                 or "Unsupported resize type" in msg

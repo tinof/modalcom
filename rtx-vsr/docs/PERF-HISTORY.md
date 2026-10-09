@@ -532,3 +532,172 @@ for 61 s with a DTS→AAC transcode, ~9 s for 10 min, 37 s for a 46-min episode)
 on that episode was 10.0 GiB. The unsegmented muxer would have held the 8 GB bitstream on
 top of that, and a Blu-ray film at 78 Mbps is ~70 GB. Below 30 s the unsegmented path is kept, because those fixed costs are not
 earned back.
+
+## Why four sessions give ~2x, and what does not fix it — measured 2026-10-04 (evening)
+
+Modal workspace `tinof`. Every run except two was on a 580.95.05 host; the two 610.57.04
+runs are marked. Probe: `scripts/probe_parallel_encode.py`, one case per single-use
+container, 61 s Night Manager sample unless noted. Run-to-run noise between containers is
+about ±5%.
+
+### Encode-only, production settings (P5 + fullres, CQ 20, level 5.1, 100 Mbps ceiling)
+
+| Case | Aggregate fps | enc % | SM % |
+|---|---|---|---|
+| UHQ, 1 / 4 / 6 / 8 sessions | 43.4 / 107.4 / 118.9 / 122.9 | 29 / 77 / 88 / 92 | 5-11 |
+| HQ, 1 / 4 sessions | 59.8 / 183.5 | 26 / 77 | 1-3 |
+| UHQ, no ceiling (driver cap, 27 Mbps), 1 / 4 sessions | 39.4 / 110.4 | 26 / 72 | 5-10 |
+| UHQ, 4 sessions in 4 processes | 109.2 (27.3-27.8 each) | 77 | 11 |
+
+- UHQ scaling is worse than HQ at matched settings: 2.5x vs 3.1x. The old 210 fps HQ figure
+  (`probe_stages.py`) had no ceiling, so it was never like-for-like.
+- Not the cause:
+  - the bitrate: uncapped UHQ scales the same;
+  - the GIL or in-process serialization: processes match threads;
+  - the temporal filter's CUDA work: SM utilisation stays near 10%.
+- The engines simply sit idle part of the time with four UHQ sessions. More sessions fill
+  some of it.
+
+### Per-worker CUDA streams: nvvfx ignores `stream_ptr` for its copies
+
+Four threads on pre-decoded GPU frames, each running VSR, integrity checks, P010 and Encode.
+All four threads encode the same frames, so a correct scheme gives four byte-identical
+outputs. Production's device-wide sync does.
+
+| Scheme | fps | Outputs identical |
+|---|---|---|
+| Production: `torch.cuda.synchronize()` per frame | 75-82 | yes |
+| Torch on stream S, nvvfx on stream 0 (the old "stream" mode) | 97 | no, striped |
+| One stream S per worker for torch, nvvfx `stream_ptr=S`, `CreateEncoder(cudastream=S)`, forwarding `__dlpack__` patch (s1-s4) | 102-105 | **no** |
+| Same, single thread | 39 | differs from production |
+| Same, on blocking streams (`cudaStreamDefault`) | 67-69 | yes |
+| nvvfx on stream 0, joined to S with events (`sz`) | 84-88 | yes |
+| `sz` with nvvfx 0.2.0.0 | 87 | yes |
+
+How the s1-s4 failure was diagnosed:
+- Exact checksums of every P010 surface handed to Encode() showed frame *i* equal to
+  production's frame *i−1*.
+- Device syncs after `run()`, a lock around VSR, and splitting `run()` apart with a host or
+  event wait before `get_output()` each left 25-30% of frames wrong.
+- Only blocking streams and `sz` matched byte for byte. Both make nvvfx's input transfer and
+  output copy legacy-stream work.
+- The outputs that came out wrong looked healthy: no striping, Laplacian 3-7. Only the md5
+  comparison across threads caught them.
+
+What does not help on top of `sz`:
+- `run(non_blocking=True)`: 86.6 fps, no change.
+- Deferring the integrity read-backs: 74-76 fps, worse.
+
+### More sessions: large in isolation, small end to end
+
+`pipe` cases (pre-decoded frames, 300 per thread):
+
+| Pipelines | Production sync | `sz` |
+|---|---|---|
+| 4 | 77-82 | 86-88 |
+| 6 | 89 | 89-93 (93 on 580; 89 on 610) |
+| 8 | 95.4 (580), 88.3 (610) | 96.5 / 96.1 |
+
+The segmented prototype (`full:K:idr:30:clip10`), a 10-min progressive 1080p25 WEB-DL clip
+(15152 frames, 21 segments), with production sync:
+
+| Sessions | cpu=6 | cpu=12 |
+|---|---|---|
+| 4 | 70.3 (610 host); 78.9-81.4 on 2026-10-04 morning | — |
+| 6 | 76.1 | 80.0 |
+| 8 | 80.6 | 82.9 |
+
+All runs were frame-exact, with clean seams and one SPS. On the real path, extra sessions
+buy little or nothing over the morning's 4-session numbers. Two reasons:
+- With 6-8 ffmpeg segment decoders starting together on 6 CPUs, each decoder's first frame
+  takes 9-11 s, against ~2 s with four.
+- 21 segments over 8 workers leave a ragged tail.
+
+The `pipe` gains do not carry over until decode start-up and load balance change.
+
+### CreateEncoder error 8 was sticky in some containers
+
+First batch, no backoff between attempts: these failed ten consecutive `CreateEncoder`
+attempts at level 5.1:
+- `enc:1:uhq:nocap`, `enc:4:uhq:nocap` and `enc:4:hq:nocap`;
+- two of the four children of `encproc:4:uhq`.
+
+Rerun with backoff: the two UHQ cases and `encproc` passed. `enc:4:hq:nocap` failed ten
+attempts again, on a 580 host.
+
+Within an affected container, every attempt failed. The 2026-10-04 morning picture ("random,
+the next attempt almost always succeeds") does not hold for every container. Production
+falls back to no level after six attempts. Investigate this before raising the session count.
+
+## TrueHDR (SDR to HDR10) and nvidia-vfx 0.2.0.0 — measured 2026-10-04
+
+`scripts/probe_truehdr.py` and a bench deploy (`rtx-bench-hdr`, one container) on the
+61 s BBC Blu-ray sample and a 273-frame progressive 1080p25 clip, 1080p to 4K,
+`HIGHBITRATE_ULTRA`, TrueHDR `contrast=102,saturation=102,middlegray=46,maxluminance=680`.
+
+### The upgrade itself (0.1.0.1 to 0.2.0.0)
+
+- Same frames, same 580 host: VSR output is 97% identical, and the rest differs by exactly
+  1/255. Mean |d| was 0.027/255 and max 1/255 on four frames.
+- `pipe:1:dev:hash`:
+  - Each version reproduces exactly run to run.
+  - 0.2.0.0's P010 checksums were the same on a 580 and a 610 host.
+  - Output size +0.04%, Laplacian unchanged, 37.7 against 37.1 fps.
+
+### Per-stage cost at 4K (single thread, synced)
+
+| Stage | ms/frame |
+|---|---|
+| VSR (`HIGHBITRATE_ULTRA`) | 3.5-3.6 |
+| TrueHDR (debanding on) | 0.96-1.06 |
+| `_hdr10_to_p010` incl. MaxCLL/MaxFALL, int64 planes | 1.74 |
+| same, int32 planes (shipped) | 1.21 |
+
+TrueHDR at other sizes: 0.57 ms at 2880x1620, 3.3 ms at 7680x4320, 3.4 ms at 8192x4320,
+with identical channel means at every size.
+
+### End to end (warm, `Video done:`)
+
+| Job | Host | SDR | HDR |
+|---|---|---|---|
+| 273 frames, single session | 580 | 36.3 fps | 34.0 / 36.3 / 37.4 |
+| 273 frames, single session | 610 | 34.2 | 35.4 / 35.4 |
+| 61 s, 4 sessions, encode phase | 580 | 72.4 | 61.1 / 63.0 (int64 conversion) |
+| 61 s, 4 sessions, encode phase | 610 | 67.4 | 55.5 / 55.4 (int32 conversion) |
+
+- **Single session:** TrueHDR is free, because the encoder is the bound.
+- **Four sessions:** HDR costs 14-18% of the encode phase. The GPU is not saturated (about
+  35% busy). Each thread's per-frame device-wide `torch.cuda.synchronize()` waits for every
+  thread's queued work, so ~1.7 ms more GPU work per frame shows up about fourfold. The
+  `infer` share rose from 30-32% to 44-45%.
+  - The lever is the same as for SDR: the `sz` stream scheme, which does not need the host
+    sync (see "Per-worker CUDA streams").
+  - Debanding off cut TrueHDR from 0.31 to 0.14 ms at 1080p, at a quality cost the user decides on.
+
+### Correctness checks that passed
+
+- **Bitstream:**
+  - The HDR10 SEI bytes are identical to libx265's.
+  - The SEI is on 8/8 keyframes of the segmented output (every FORCEIDR seam and gop-250
+    IDR) and 2/2 on the short clip.
+  - The `colr` nclx box is present. Tags are bt2020nc / bt2020 / smpte2084 / topleft, level 153.
+- **Determinism and threads:**
+  - Byte-identical sizes run to run (34.2 MB x3, 588.1 MB x2).
+  - TrueHDR is stateless: forwards and backwards are identical.
+  - Four threads match one thread on every P010 hash.
+- **Pixels:**
+  - Flat-frame and Laplacian checks on tone-mapped frames, seams included, are in the
+    source range.
+  - `_hdr10_to_p010` is within ±1 code of float64 (1.6e-5 of luma samples differ).
+  - The encode round trip is ordinary codec loss: signed error ≈ 0 and absolute error below
+    SDR's on the same frames. HDR files at CQ 20 were 28% smaller on the short clip and the
+    same size on the grainy 61 s sample (100 Mbps ceiling).
+- **Light levels:** measured MaxCLL 679 nits, against 680 signalled. Measured MaxFALL was
+  30-52 nits on these dark drama test clips, against the 300 the StaxRip command signals.
+  Full films with bright scenes measure higher, so no single constant fits; the measured
+  values became the default `max_cll` (CLAUDE.md section 6). Letterbox bars count in the frame
+  average, so MaxFALL reads slightly low on letterboxed sources (~1.33x for 2.39:1).
+- **10-bit:**
+  - `x2bgr10le` decode reads +0.5 codes against the exact rgb24 path; rgb48 reads 1-1.5 low.
+  - 10-bit VSR output differs from the 8-bit path by 3 codes (0.3%) on average.
+  - DENOISE/DEBLUR in RGB10A2 return alpha 0. VSR ignores it, and the code restores 3 anyway.
