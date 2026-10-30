@@ -11,7 +11,7 @@ numpy==1.26.4
 opencv-python==4.11.0.86
 opencv-python-headless==4.11.0.86
 peft==0.16.0
-pillow==12.3.0
+pillow==13.0.0
 safetensors==0.5.3
 sentencepiece==0.2.2
 transformers==5.10.1
