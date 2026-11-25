@@ -41,7 +41,10 @@ def _default_output_path(input_path: Path, response: requests.Response) -> Path:
         return input_path.with_name(header_name)
 
     content_type = response.headers.get("content-type", "").lower()
-    extension = ".mp4" if "video" in content_type else ".png"
+    if "matroska" in content_type:
+        extension = ".mkv"
+    else:
+        extension = ".mp4" if "video" in content_type else ".png"
     return input_path.with_name(f"{input_path.stem}_upscaled{extension}")
 
 
@@ -108,6 +111,19 @@ def run() -> None:
              "Empty (default): measured per job from the output frames.",
     )
     parser.add_argument(
+        "--container", default="mp4", choices=["mp4", "mkv"],
+        help="Video output container. mkv copies the source's audio, subtitles and chapters "
+             "as they are; mp4 (default) re-encodes audio mp4 cannot carry and drops subtitles.",
+    )
+    parser.add_argument(
+        "--strength", type=float, default=1.0,
+        help="Upscale effect strength, 0.0-1.0. Lower values blend the model's effect back.",
+    )
+    parser.add_argument(
+        "--preprocess-strength", type=float, default=1.0,
+        help="Effect strength of the --preprocess pass, 0.0-1.0.",
+    )
+    parser.add_argument(
         "--no-keep-aspect-ratio",
         action="store_false",
         dest="keep_aspect_ratio",
@@ -142,6 +158,9 @@ def run() -> None:
             "truehdr": args.truehdr,
             "master_display": args.master_display,
             "max_cll": args.max_cll,
+            "container": args.container,
+            "strength": str(args.strength),
+            "preprocess_strength": str(args.preprocess_strength),
         }
 
         with input_path.open("rb") as f:

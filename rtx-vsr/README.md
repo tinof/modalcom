@@ -61,6 +61,17 @@ CUDA tensor, and NVENC encodes straight from GPU memory. Output is **HEVC Main 1
 (`yuv420p10le`, Level 5.1 High tier) tagged bt709 for matrix, primaries and transfer, or
 HDR10 when `truehdr` is set (see below).
 
+### Output container: mp4 or Matroska
+
+The container is **mp4** by default. `container=mkv` writes Matroska from the same encode:
+`mkvmerge` takes the video and copies the source's audio, subtitles, chapters, attachments
+and tags as they are. mp4 has to re-encode audio it cannot carry (DTS, TrueHD) to AAC and
+drops subtitles; the MKV keeps them, and converts mp4 timed text to SRT. The MKV track
+header repeats the colour signalling and, for HDR10, the mastering display and
+MaxCLL/MaxFALL. mkvmerge does not copy those from the bitstream, and players that read
+colour from the container would otherwise see an untagged stream. A source that mkvmerge
+cannot read is rejected with 400 before any GPU work. Image inputs have no container.
+
 ### Default encoder settings
 
 Chosen by measurement on 2026-10-03 (BBC Blu-ray, 1080p→4K, `HIGHBITRATE_ULTRA`; details in
@@ -470,6 +481,32 @@ python modal_client.py \
 	--scale 2.0 --quality HIGHBITRATE_ULTRA --preprocess DEBLUR_ULTRA
 ```
 
+### Effect strength
+
+`strength` (0.0-1.0, default 1.0) is the SDK's own effect strength for the upscale, and
+`preprocess_strength` the same for the `preprocess` pass. Lower values blend the model's
+effect back towards a plain resample. It works in all four families. On a 1080p web-encode
+still at 2x (mean absolute Laplacian, a detail measure; a plain `BICUBIC` upscale is 1.01):
+
+| Mode | strength 1.0 | 0.5 | 0.0 |
+|---|---|---|---|
+| `ULTRA` | 2.98 | 1.78 | 1.24 |
+| `HIGHBITRATE_ULTRA` | 2.40 | 1.68 | — |
+| `HIGHBITRATE_ULTRA` + `DENOISE_MEDIUM` preprocess | 1.59 | 1.86 | 2.40 (no preprocess) |
+| `HIGHBITRATE_ULTRA` + `DEBLUR_ULTRA` preprocess | 3.48 | 2.52 | 2.40 (no preprocess) |
+
+These are detail figures from one still. Noise and flicker in motion were not measured,
+and CLAUDE.md explains why still-frame sharpness alone misleads, so judge a short clip in
+motion before a batch run. At 1.0 the SDK call is the one this service always made; a
+default image job was byte-identical before and after the change.
+
+```bash
+python modal_client.py \
+	--endpoint "https://<workspace>--rtx-media-upscaler-api.modal.run" \
+	--input ./web_encode.mkv \
+	--scale 2.0 --quality ULTRA --strength 0.6 --container mkv --truehdr
+```
+
 ## Comparing Results
 
 `scripts/compare_frames.py` builds side-by-side comparison images from an input and an output
@@ -509,7 +546,7 @@ python modal_client.py \
 	--quality HIGH
 ```
 
-The client submits the job, polls until the worker finishes, and saves the output locally (`*_upscaled.png` or `*_upscaled.mp4`) unless `--output` is provided. Tune the wait with `--timeout` and `--poll-interval`. Transient network errors and proxy 502/503/504 answers are retried with backoff. If the client stops anyway, resume the same job with `--call-id <call_id>` (printed at submit time) instead of uploading again. The download goes to `<output>.part` and is renamed only when its size matches `Content-Length`.
+The client submits the job, polls until the worker finishes, and saves the output locally (`*_upscaled.png`, `*_upscaled.mp4`, or `*_upscaled.mkv` with `--container mkv`) unless `--output` is provided. Tune the wait with `--timeout` and `--poll-interval`. Transient network errors and proxy 502/503/504 answers are retried with backoff. If the client stops anyway, resume the same job with `--call-id <call_id>` (printed at submit time) instead of uploading again. The download goes to `<output>.part` and is renamed only when its size matches `Content-Length`.
 
 ## Direct API Usage
 
@@ -526,7 +563,9 @@ curl -X POST "https://<workspace>--rtx-media-upscaler-api.modal.run/upscale" \
 
 For HDR10 video output add `-F "truehdr=on"` (or a `contrast=…,maxluminance=…` list), and
 optionally `-F "master_display=G(…)B(…)R(…)WP(…)L(…,…)"` and `-F "max_cll=680,300"`
-(without `max_cll`, the measured values are written).
+(without `max_cll`, the measured values are written). `-F "container=mkv"` selects the
+Matroska output, and `-F "strength=0.6"` / `-F "preprocess_strength=0.5"` set the effect
+strength.
 
 Poll for the result. While the job runs this returns HTTP 202; on completion it returns the file:
 
