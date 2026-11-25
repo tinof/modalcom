@@ -6,7 +6,7 @@ Last session: 2026-11-25. Written for whoever picks this up next, assuming no me
 
 The FlashVSR+ worker (`modal_app/plus_*.py`, `client.py`) is written, reviewed and tested locally. **It has never been built, deployed or run on Modal, and no frame has been upscaled.** That was the owner's decision for the session: code only, no Modal spend, and the test run will use a file the owner supplies. Do not upload or process the Selviytyjät S06E02 episode that the session started from.
 
-Branch `flashvsr-plus-worker`, one commit on top of `main`, pushed, draft PR open. The repo has no `.claude/workflow.md`, so `/ship:land` cannot run here; the PR waits for the owner or for `/ship:roadmap-init`.
+Branch `flashvsr-plus-worker` on top of `main`, pushed, draft PR #13 (https://github.com/tinof/modalcom/pull/13). The repo has no `.claude/workflow.md`, so `/ship:land` cannot run here; the PR waits for the owner or for `/ship:roadmap-init`.
 
 `README.md` is the reference: cost estimate, design, runbook, and an exact list of what is and is not tested. Read it first. The approved plan is `~/.claude/plans/can-you-review-our-encapsulated-melody-of-1195689c-741d-47aa-908a-63818cd43d83.md`.
 
