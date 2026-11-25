@@ -23,9 +23,9 @@ Because video jobs can run far longer than Modal's 150-second HTTP request limit
 - `modal_app.py`: the Modal app (web tier + GPU worker).
 - `modal_client.py`: local client that uploads, polls, and saves the output.
 
-## Two Constraints That Are Easy To Break
+## Three Pins That Are Easy To Break
 
-Both are pinned in `modal_app.py`. Read this before changing the image.
+All three are pinned in `modal_app.py`. Read this before changing the image.
 
 **1. The NGX driver library (`DRIVER_VERSION`).** RTX Video Super Resolution is an NGX
 feature. The `nvidia-vfx` wheel bundles the NGX snippet, but at runtime it `dlopen`s the
@@ -37,8 +37,12 @@ NvVFX_Load failed: The effect has not been properly initialized (code -12)
 ```
 
 The image therefore installs that one library from the matching NVIDIA driver package.
-`DRIVER_VERSION` must track the host driver reported by `nvidia-smi` (currently
-`580.95.05`); the worker logs a warning at startup if the two diverge.
+`DRIVER_VERSION` must track the host driver reported by `nvidia-smi`; the worker logs a
+warning at startup if the two diverge. The image pins `580.95.05`. Modal's hosts have moved
+on since: on 2026-11-25 containers ran on `610.57.04` and `620.70.06`, and none on 580.
+VSR and TrueHDR still load with the 580 library, so the warning fires at every start. The
+pin has not been moved, because containers land on hosts with different drivers and no
+single value matches all of them.
 
 **2. The ffmpeg build (`FFMPEG_URL`).** NVENC availability depends on which NVIDIA Video
 Codec SDK the ffmpeg binary was linked against, and each SDK sets a minimum driver version:
@@ -53,6 +57,14 @@ Pointing `FFMPEG_URL` at `master-latest` makes every NVENC encoder fail to initi
 the worker falls back to CPU `libx264`. Encoder preference is `hevc_nvenc` → `h264_nvenc`
 → `libx264`; `av1_nvenc` also works on the pinned build if you want it, but HEVC is the
 safer default for MP4 playback.
+
+The table was measured on 580 hosts. Hosts on 610 and later meet `master-latest`'s driver
+requirement, but the fleet is mixed and that build has not been re-tested, so the pin stays.
+
+**3. mkvmerge (`MKVTOOLNIX_VERSION`).** The Matroska output uses `mkvmerge` 104 from the
+MKVToolNix author's apt repository, pinned by version, with the repository key checked by
+hash. Debian bookworm's own v74 does not see mp4 timed-text subtitles and drops them
+without an error.
 
 ## Video output format and throughput
 
@@ -610,4 +622,4 @@ The structure here is deliberately generic; only the upscaling logic is domain-s
 ## Compatibility Notes
 
 - The runtime contract is HTTP upload/download.
-- Video output is encoded with NVENC HEVC/H.264 when the GPU encoder is available (falling back to `libx264`), and **every** source audio track is kept. Each track is stream-copied when mp4 can carry its codec (AAC, AC-3, E-AC-3, Opus, ALAC, MP3, FLAC); any other codec (DTS, TrueHD, PCM, ...) is re-encoded to AAC 192k for that track only, with a warning in the worker log. (Before 2026-10-03 only the first audio track was kept, and the GPU-encoder path always re-encoded it to AAC.)
+- Video output is encoded with NVENC HEVC/H.264 when the GPU encoder is available (falling back to `libx264`), and **every** source audio track is kept. Each track is stream-copied when mp4 can carry its codec (AAC, AC-3, E-AC-3, Opus, ALAC, MP3, FLAC); any other codec (DTS, TrueHD, PCM, ...) is re-encoded to AAC 192k for that track only, with a warning in the worker log. (Before 2026-10-03 only the first audio track was kept, and the GPU-encoder path always re-encoded it to AAC.) With `container=mkv` nothing is re-encoded: every audio and subtitle track, the chapters and the attachments are copied from the source as they are.
