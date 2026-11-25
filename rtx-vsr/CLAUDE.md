@@ -304,7 +304,14 @@ deploy.
   (`BICUBIC` mode: 1.01), `HIGHBITRATE_ULTRA` 2.40 / 1.68, and the `DENOISE_MEDIUM` and
   `DEBLUR_ULTRA` preprocess passes move halfway back at 0.5. `ULTRA` at 0.5 is close to,
   but not exactly, the average of 1.0 and 0.0 (mean abs diff 0.25/255), and 0.0 is not the
-  `BICUBIC` mode (0.55/255). It also works in RGB10A2 (10-bit sources).
+  `BICUBIC` mode (0.55/255).
+  - RGB10A2 (10-bit sources): `ULTRA` at 0.5 gave a 28% smaller file than at 1.0 and a
+    lower Laplacian (2.00 against 2.24), so the kwarg takes effect there too.
+  - Segmented path: each session thread builds its own effect (four `VSR effect … at
+    strength` log lines), and a default HDR job before and after a strength job was
+    byte-identical, so no thread reuses a stale effect.
+  - These are still-frame detail figures. Noise and flicker at reduced strength were not
+    measured; do that (static-patch frame difference) before recommending a value.
 
 ## The scripts directory
 

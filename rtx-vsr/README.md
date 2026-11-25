@@ -495,9 +495,10 @@ still at 2x (mean absolute Laplacian, a detail measure; a plain `BICUBIC` upscal
 | `HIGHBITRATE_ULTRA` + `DENOISE_MEDIUM` preprocess | 1.59 | 1.86 | 2.40 (no preprocess) |
 | `HIGHBITRATE_ULTRA` + `DEBLUR_ULTRA` preprocess | 3.48 | 2.52 | 2.40 (no preprocess) |
 
-Use it when a mode is right in kind but too strong: `ULTRA` at 0.5-0.7 keeps most of its
-artifact suppression with less of the processed look. At 1.0 the SDK call is the one this
-service always made, and the output is byte-identical to before.
+These are detail figures from one still. Noise and flicker in motion were not measured,
+and CLAUDE.md explains why still-frame sharpness alone misleads, so judge a short clip in
+motion before a batch run. At 1.0 the SDK call is the one this service always made; a
+default image job was byte-identical before and after the change.
 
 ```bash
 python modal_client.py \
