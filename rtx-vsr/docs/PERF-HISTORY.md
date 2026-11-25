@@ -701,3 +701,96 @@ with identical channel means at every size.
   - `x2bgr10le` decode reads +0.5 codes against the exact rgb24 path; rgb48 reads 1-1.5 low.
   - 10-bit VSR output differs from the 8-bit path by 3 codes (0.3%) on average.
   - DENOISE/DEBLUR in RGB10A2 return alpha 0. VSR ignores it, and the code restores 3 anyway.
+
+## Driver 620 hosts, a full HDR episode, Matroska output and strength — measured 2026-11-25
+
+RTX-PRO-6000, image unchanged since 2026-10-12 (NGX library from 580.95.05) until the
+Matroska change the same day. Every container that day ran on a **610.57.04** or a
+**620.70.06** host, none on 580. VSR and TrueHDR loaded on both.
+
+### First full-length HDR job
+
+1080p25 H.264 web encode (4.7 Mbps), 65 min 48 s, 98,700 frames, 2x, `HIGHBITRATE_ULTRA`,
+`truehdr=on` with the defaults, first job in its container, 620.70.06 host:
+
+| | |
+|---|---|
+| End to end | 1212.6 s = **81.4 fps** |
+| Setup | 15.5 s (effects 12.6 s, encoders 2.8 s) |
+| Encode phase | 1160.8 s = **85.0 fps**, 132 segments on 4 sessions |
+| Join | 36.4 s |
+| Stage split (summed over sessions) | decode-wait 0%, infer 54%, encode 45% |
+| Peak RSS | 9.8 GiB |
+| Output | 11,078,272,033 bytes (22.4 Mbps), 98,700 packets |
+| Light levels | measured 678.8 / 666.8 nits, written 679 / 667 |
+
+- HDR10 SEI on 397 of 397 keyframes; `Main 10`, level 153, BT.2020/PQ, top-left chroma.
+- MaxFALL 667 nits means at least one frame is almost fully white (a flash or a fade).
+- 85 fps is above the 55-63 fps measured for segmented HDR in October on 580 and 610
+  hosts. No SDR run of the same input and no 580 host were available, so the cause
+  (driver, content, or both) is not established.
+- Not run: an every-frame decode of the output. On the shared 4-core host it measured
+  about 7 fps while other jobs ran, about 4 hours for this file.
+
+### Short clips (14 s single session, 42 s segmented)
+
+| Job | Result |
+|---|---|
+| 42 s HDR, first job in a cold container | 19.1 fps end to end; setup 24.0 s (effects 20.1 s), encode 34.8 fps |
+| 42 s HDR, warm, mp4 or mkv | 50-64 fps end to end; encode 68.5-76.9 fps; setup 2.2-5.6 s; join 0.4-0.7 s |
+| 14 s SDR 2x, warm, single session | 34.5-40.3 fps |
+| 14 s SDR 1.5x, `ULTRA` at strength 0.5 | 69.6 fps |
+| 14 s 10-bit SDR 2x | 37.8-39.3 fps |
+| 14 s SDR 2x, GPU encoder off (piped fallback) | 4.8 and 7.9 fps |
+
+A cold first job on a short clip says nothing about throughput: NGX initialisation is most
+of it.
+
+### Output size by host
+
+The same 14 s clip, default settings: 52,814,419 bytes in four containers on 620.70.06
+hosts (three bench deploys and production v25), and 58,262,254 bytes on a 610.57.04 host.
+The 610 run was the old code (v24) and the 620 runs the new, so this pair does not separate
+driver from code. What does: a default image job was byte-identical on v24 and on the new
+code, and the default mp4 remux command is unchanged.
+
+### Matroska output (`container=mkv`)
+
+- mkvmerge copies neither the VUI nor the HDR10 SEI into the track header; the header
+  fields are passed explicitly.
+- Debian bookworm's mkvmerge v74 did not list an mp4 `mov_text` track in `mkvmerge -J` and
+  dropped it with exit code 0. It also put the mp4 source's audio at 0 where ffmpeg puts
+  it at 0.015 s. v104 from the author's repository converts the track to SRT (4 cues) and
+  matches ffmpeg's audio start.
+- mkv and mp4 jobs on the same clip have the same pixel statistics, packet counts and
+  HDR10 SEI; only the container differs. Sizes: 105,062,857 (mkv) and 105,083,343 (mp4)
+  bytes for the 42 s HDR clip.
+- A Matroska source starting at 10 s (AAC + DTS, a subtitle, chapters): audio at 0.015 s,
+  DTS copied (1313 packets), chapters moved from 10-22 s to 0-12 s.
+- The mux cost was not measurable on 42 s clips (join 0.4-0.7 s either way). A full-length
+  mkv job has not run; read its `join` time when one does.
+
+### Effect strength, one 1080p still at 2x
+
+Mean absolute Laplacian of the 4K output (the `BICUBIC` mode gives 1.01):
+
+| Mode | 1.0 | 0.5 | 0.0 |
+|---|---|---|---|
+| `ULTRA` | 2.98 | 1.78 | 1.24 |
+| `HIGHBITRATE_ULTRA` | 2.40 | 1.68 | — |
+| `HIGHBITRATE_ULTRA` after `DENOISE_MEDIUM` | 1.59 | 1.86 | 2.40 (no preprocess) |
+| `HIGHBITRATE_ULTRA` after `DEBLUR_ULTRA` | 3.48 | 2.52 | 2.40 (no preprocess) |
+
+- `ULTRA` at 0.5 differs from the average of 1.0 and 0.0 by 0.25/255 (mean abs), and 0.0
+  differs from the `BICUBIC` mode by 0.55/255: close to a linear blend, not exactly one.
+- 10-bit (RGB10A2): `ULTRA` at 0.5 gave 35.9 MB against 49.9 MB at 1.0 for the 14 s clip,
+  Laplacian 2.00 against 2.24.
+- Segmented: a default HDR job before and after an `ULTRA` 0.6 job was byte-identical
+  (105,062,857 bytes), with the strength line logged once per session thread.
+- Still-frame detail only. Noise and flicker at reduced strength were not measured.
+
+### The piped fallback lost tail frames
+
+With `MODAL_GPU_ENCODER=0` the 14 s clip (352 frames, audio 80 ms shorter than the video)
+came out with 347 frames: `-shortest` cut the picture to the audio. Without the flag both
+containers have 352. The GPU paths never used it.

@@ -70,6 +70,11 @@ logs a warning at container start when they diverge. If VSR breaks after a Modal
 upgrade, check this first. The failure is *not* GPU-model-specific — do not go GPU
 shopping when you see `-12`.
 
+State on 2026-11-25: the image pins 580.95.05, and every container that day ran on a
+610.57.04 or a 620.70.06 host. VSR and TrueHDR loaded on both, so the mismatch WARNING is
+in every log and is not a failure by itself. No single `DRIVER_VERSION` matches a mixed
+fleet; moving the pin needs the verification protocol on both drivers.
+
 ### 2. ffmpeg's NVENC support is gated on the driver (`FFMPEG_URL`)
 
 Newer is **not** better. Each ffmpeg build links a Video Codec SDK with a minimum driver
@@ -80,6 +85,9 @@ version:
 | BtbN `master-latest` | 13.1.15 | 610.0+ | **No** |
 | BtbN `n8.1` (pinned) | — | 570.0+ | Yes, incl. `av1_nvenc` |
 | Debian apt ffmpeg 5.1 | — | — | Yes, no `av1_nvenc` |
+
+The last column was measured on 580 hosts. 610.57.04 and 620.70.06 hosts (2026-11-25) meet
+`master-latest`'s requirement, but the fleet is mixed and it has not been re-tested.
 
 Pointing `FFMPEG_URL` at `master-latest` makes every NVENC encoder fail to initialize and
 the worker falls back to CPU `libx264` — correct output, roughly an order of magnitude
@@ -197,6 +205,10 @@ feature. Everything below was probed with `scripts/probe_truehdr.py`.
     saturated; every thread's device-wide sync waits on all threads' extra work. The `sz`
     stream scheme is the lever. Keep per-frame HDR work off the full frame where a
     subsample will do (the integrity stats use 1/16).
+  - Those figures are from 580 and 610 hosts (2026-10). On a 620.70.06 host on 2026-11-25
+    a full 66-min episode ran its HDR encode phase at 85.0 fps (81.4 end to end), and warm
+    42 s clips at 69-77 fps. No SDR run of the same inputs was made that day, so the HDR
+    cost on that driver is not known.
   - The encode round trip is ordinary codec loss: signed error ≈ 0, and the absolute error
     is below SDR's on the same frames.
   - PQ packs SDR-range content into fewer codes (Y std 64 vs 88), so at CQ 20 HDR files
@@ -534,6 +546,9 @@ these choices was measured; see [docs/PERF-HISTORY.md](docs/PERF-HISTORY.md).
 - **Run-to-run identity holds per host driver.** Modal has started placing containers on
   hosts with driver 610.57.04. Outputs from those hosts differed from the 580 hosts and
   from each other. Compare sizes within one warm container.
+  On 2026-11-25 the hosts were 610.57.04 and 620.70.06. On 620 the same 14 s clip gave
+  52,814,419 bytes in four containers (three bench deploys and production v25), so identity
+  also held between containers there.
 
 ### Settled — do not re-derive without reading the history first
 

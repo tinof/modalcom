@@ -1,8 +1,9 @@
 """Build side-by-side comparison images from an original and an upscaled video.
 
 Frames are matched by index, not timestamp: the worker pipes decoded frames in
-order, so frame N of the input is frame N of the output (the tail may be trimmed
-by ffmpeg's -shortest, hence the frame-count check below).
+order, so frame N of the input is frame N of the output. The piped fallback used
+to trim the tail with ffmpeg's -shortest (removed 2026-11-25); the frame-count check
+below stays as a guard.
 """
 
 import argparse
