@@ -693,7 +693,10 @@ def _identify_matroska_source(source_path: str) -> dict:
         raise ContainerRequestError(
             "Container request: container=mkv needs mkvmerge, which this image does not have."
         )
-    result = subprocess.run(["mkvmerge", "-J", source_path], capture_output=True, text=True)
+    result = subprocess.run(
+        ["mkvmerge", "-J", source_path], capture_output=True, text=True,
+        env={**os.environ, "LC_ALL": "C.UTF-8"},
+    )
     try:
         info = json.loads(result.stdout)
     except ValueError:
@@ -773,7 +776,9 @@ def _mux_matroska(video_path: Path, source_path: Path, output_path: Path,
     except ValueError:
         source_format, start_ms = {}, 0
     shift: list[str] = []
-    if start_ms and "matroska" in source_format.get("format_name", ""):
+    # A slightly negative start is codec delay (Opus pre-skip), which mkvmerge carries
+    # correctly by itself, so only a positive start is removed.
+    if start_ms > 0 and "matroska" in source_format.get("format_name", ""):
         for track in source.get("tracks", []):
             if track.get("type") != "video":
                 shift += ["--sync", f"{track['id']}:{-start_ms}"]
@@ -793,10 +798,13 @@ def _mux_matroska(video_path: Path, source_path: Path, output_path: Path,
         command, capture_output=True, text=True,
         env={**os.environ, "LC_ALL": "C.UTF-8"},
     )
-    # mkvmerge exits 1 for warnings (the file is complete) and 2 for errors.
-    if result.returncode >= 2 or not partial_path.exists():
+    # mkvmerge exits 0, or 1 for warnings (the file is complete). Anything else is a
+    # failure, including the negative status of a run killed by a signal, which can
+    # leave a file with valid headers and a truncated body.
+    if result.returncode not in (0, 1) or not partial_path.exists():
         partial_path.unlink(missing_ok=True)
-        raise RuntimeError(f"Matroska muxing failed: {result.stdout.strip()[-1500:]}")
+        detail = (result.stdout.strip() or result.stderr.strip())[-1500:]
+        raise RuntimeError(f"Matroska muxing failed (exit {result.returncode}): {detail}")
     if result.returncode == 1:
         warnings = [line for line in result.stdout.splitlines() if "arning" in line]
         print(f"WARNING: mkvmerge reported: {' | '.join(warnings)[-1000:]}")
@@ -1027,7 +1035,7 @@ def _ffmpeg_encode_command(
     output_width: int,
     output_height: int,
     fps: float,
-    audio_source_path: str,
+    audio_source_path: str | None,
     output_path: str,
     tune: str | None = None,
     refs: bool = False,
@@ -1058,7 +1066,8 @@ def _ffmpeg_encode_command(
         "-f", "rawvideo", "-pix_fmt", "rgb24",
         "-s", f"{output_width}x{output_height}", "-r", fps_str,
         "-i", "pipe:0",
-        "-i", audio_source_path,
+        # No audio source: the output is the video-only intermediate of an mkv job.
+        *(["-i", audio_source_path] if audio_source_path else []),
         "-map", "0:v:0",
         # Raw RGB carries no color metadata, so swscale would convert with its bt601
         # default while players read HD output as bt709 — a visible hue shift. Convert
@@ -1069,7 +1078,7 @@ def _ffmpeg_encode_command(
                "setparams=colorspace=bt709:color_primaries=bt709:color_trc=bt709:range=tv",
         "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709",
         *codec_args,
-        *_audio_args(audio_source_path),
+        *(_audio_args(audio_source_path) if audio_source_path else ["-an"]),
         # No -shortest: it cut the picture to the audio's length (347 of 352 frames on a
         # clip whose audio ended 80 ms early, probed 2026-11-25). The GPU paths never had it.
         "-movflags", "+faststart",
@@ -2864,8 +2873,8 @@ class UpscaleWorker:
         output_name = f"{stem}_upscaled.{container}"
         output_path = output_dir / output_name
         scratch_dir = scratch_dir or output_dir
-        # The piped encoder writes mp4 with audio. For mkv that file is a local
-        # intermediate and mkvmerge takes only its video track.
+        # For mkv the piped encoder writes a video-only local intermediate, and mkvmerge
+        # adds the source's other tracks.
         encode_path = scratch_dir / "piped-video.mp4" if container == "mkv" else output_path
         stderr_path = scratch_dir / "ffmpeg.log"
         decode_log_path = scratch_dir / "ffmpeg-decode.log"
@@ -2886,7 +2895,7 @@ class UpscaleWorker:
             output_width=plan.output_width,
             output_height=plan.output_height,
             fps=fps,
-            audio_source_path=input_path.as_posix(),
+            audio_source_path=None if container == "mkv" else input_path.as_posix(),
             output_path=encode_path.as_posix(),
             tune=getattr(self, "encoder_tune", None),
             refs=getattr(self, "encoder_refs", False),
