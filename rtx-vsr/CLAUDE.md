@@ -264,6 +264,48 @@ feature. Everything below was probed with `scripts/probe_truehdr.py`.
     sets it again before VSR.
   - TrueHDR's model is 8-bit, so for HDR output the gain is VSR precision only.
 
+### 7. Matroska output (`container=mkv`) and effect strength
+
+Both are optional request fields added 2026-11-25. Their defaults (`mp4`, `1.0`) run the
+code that was there before: a default image job was byte-identical on the old and the new
+deploy.
+
+- **`container=mkv` is a second mux, not a different encode.**
+  - `_remux_output` runs the same ffmpeg copy remux (the colour VUI needs it; mkvmerge
+    never edits the SPS), video only, into a local intermediate.
+  - `_mux_matroska` then calls `mkvmerge`: video from the intermediate, everything else
+    (audio, subtitles, chapters, attachments, tags) straight from the source. Nothing is
+    re-encoded, so DTS and TrueHD survive and `MP4_AUDIO_COPY_CODECS` does not apply.
+  - The 4K pixels, frame counts and HDR SEI of an mkv and an mp4 job on the same clip were
+    the same; only the container differs.
+- **mkvmerge copies neither the VUI nor the HDR10 SEI into the track header** (probed, v104).
+  `_mkv_colour_args` passes them: bt709 for SDR; BT.2020/PQ, chroma siting 1,1, mastering
+  display and the MaxCLL/MaxFALL that `_signal_light_levels` returns for HDR. Without them
+  `mkvmerge -J` shows an empty Colour element and ffprobe shows no stream side data.
+- **mkvmerge is pinned from the author's apt repository** (`MKVTOOLNIX_VERSION`, key checked
+  by `MKVTOOLNIX_KEY_SHA256`). Debian bookworm's v74 does not see mp4 timed text
+  (`mov_text`) at all: `mkvmerge -J` did not list the track and the mux dropped it with
+  exit code 0. v104 converts it to SRT. `_mux_matroska` therefore counts audio and subtitle
+  tracks against the source and prints a WARNING when any are missing.
+- **Timestamps differ by source container.** ffmpeg's remux shifts a source to start at 0.
+  mkvmerge keeps a Matroska source's timestamps (a source starting at 10 s kept its audio at
+  10 s beside our video at 0) and normalises MPEG-TS by itself. So Matroska sources with a
+  non-zero `start_time` get `--sync <track>:-<start>` per track and `--chapter-sync`.
+  Verified: audio at 0.015 s, chapters moved from 10-22 s to 0-12 s.
+- **mkvmerge reads file names in the locale's charset.** It writes `matroska-output.part`
+  and Python renames it to the final name, which may hold any character the upload had.
+- **A source mkvmerge cannot identify is rejected before GPU work** (`ContainerRequestError`,
+  400), and so is `container=mkv` for an image.
+- **`ffprobe -show_entries stream=... -of csv` lists MPEG-TS streams twice** (once per
+  program). Count streams from `-of json`, top level only.
+- **`strength` and `preprocess_strength`** go to `nvvfx.VideoSuperRes(strength=...)` and are
+  part of the effect cache key. The kwarg is passed only below 1.0. Measured on a still at
+  2x, it scales every family: `ULTRA` Laplacian 2.98 / 1.78 / 1.24 at 1.0 / 0.5 / 0.0
+  (`BICUBIC` mode: 1.01), `HIGHBITRATE_ULTRA` 2.40 / 1.68, and the `DENOISE_MEDIUM` and
+  `DEBLUR_ULTRA` preprocess passes move halfway back at 0.5. `ULTRA` at 0.5 is close to,
+  but not exactly, the average of 1.0 and 0.0 (mean abs diff 0.25/255), and 0.0 is not the
+  `BICUBIC` mode (0.55/255). It also works in RGB10A2 (10-bit sources).
+
 ## The scripts directory
 
 | Script | Use it when |
@@ -274,7 +316,7 @@ feature. Everything below was probed with `scripts/probe_truehdr.py`.
 | `probe_nvdec.py` | Re-testing decoder classes after a PyNvVideoCodec upgrade (is `ThreadedDecoder` fixed yet?). |
 | `probe_nvdec_rgb.py` | Re-testing the NVDEC `OutputColorType.RGB` path and its surface layout. |
 | `probe_p010_encode.py` | Any suspicion of corrupt GPU-encoder output — striping, stale or flat frames. |
-| `verify_roundtrip.py` | Running the deployed worker on a Volume-staged job, warm, without proxy tokens. `MODAL_APP_NAME` selects a bench deploy. |
+| `verify_roundtrip.py` | Running the deployed worker on a Volume-staged job, warm, without proxy tokens. Flags for quality, preprocess, scale, `--truehdr`, `--container` and the strengths. `MODAL_APP_NAME` selects a bench deploy. |
 | `probe_nvdec_interlace.py` | Re-testing whether in-process NVDEC still deinterlaces interlace-flagged PsF input (row-parity diff against ffmpeg's woven decode). |
 | `probe_stages.py` | Per-stage timing: VSR alone, encode alone per preset, serial vs overlapped, N concurrent NVENC sessions. One encoder per single-use container. |
 | `probe_parallel_encode.py` | Several NVENC sessions in one process: encode-only scaling (HQ/UHQ, with or without the ceiling, threads or processes, with nvidia-smi utilisation), per-thread pipelines and their stream schemes (with md5 and exact P010 checksums via `:hash`), segment joins, CreateEncoder error-8 rates, and a segmented prototype on a staged clip. `PROBE_VFX=0.1.0.1` re-tests the old nvvfx wheel (default: the production 0.2.0.0). |
@@ -633,6 +675,16 @@ arguments and nothing else — the app imported cleanly for the entire period wh
     - The `HDR10 light levels:` line is present, and fps is within a few percent of SDR.
     - Also run a 10-bit SDR source and a mixed sequence in one container (image, SDR 4K,
       HDR 4K, SDR 1620p, 10-bit, HDR 4K). Effects that change size are where error 8 lives.
+11. **Any change near the remux or the Matroska output** also runs `container=mkv` jobs:
+    SDR and HDR, short and ≥30 s, and one source with extra audio, subtitles, chapters and
+    a non-zero start time. Check all of these:
+    - `mkvmerge -J`: the video track's colour fields are set (and for HDR the mastering
+      display and light levels); every audio and subtitle track of the source is there.
+    - `ffprobe`: stream side data lists both HDR entries; audio starts where the mp4
+      output's does; the video packet count equals the source's frame count.
+    - The worker log has `Matroska muxer: mkvmerge v…` and no `WARNING: the Matroska output`.
+    - The same job with `container=mp4` still passes steps 4-6.
+    Short clips are enough: the mux does not depend on the length.
 
 **The lasting lesson of the striping bug is verification, not encoders:** for a full day
 that path produced visibly broken 4K while passing frame count, `ffprobe`, a clean decode

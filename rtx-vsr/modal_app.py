@@ -1,5 +1,6 @@
 import contextlib
 import dataclasses
+import json
 import math
 import mmap
 import os
@@ -151,6 +152,13 @@ FFMPEG_URL = (
 FFMPEG_SHA256 = "97ce978979194b5cf7e06a5e68020dbdaa7a4f3294c5452b6a1bc347100dbb79"
 
 # The web tier only moves bytes, so it stays off the GPU image entirely.
+# mkvmerge for container=mkv, from https://mkvtoolnix.download (the author's repository,
+# which keeps every release since v77 for bookworm). The key is checked by hash, so the
+# image build fails if it is ever replaced.
+MKVTOOLNIX_VERSION = "104.0-0~debian12bunkus01"
+MKVTOOLNIX_KEY_URL = "https://mkvtoolnix.download/gpg-pub-moritzbunkus.gpg"
+MKVTOOLNIX_KEY_SHA256 = "7e1f8b41cfdce8b241dcd80814d55e9d78c4cdab04d8dcba2e3cd6ea55454dc0"
+
 web_image = modal.Image.debian_slim(python_version="3.12").uv_pip_install(
     "fastapi[standard]==0.141.1",
     "python-multipart==0.0.32",
@@ -188,6 +196,22 @@ gpu_image = (
         "torch==2.13.0",
         "nvidia-vfx==0.2.0.0",
         "PyNvVideoCodec==2.2.3",
+    )
+    # mkvmerge writes the optional Matroska output (container=mkv). From the MKVToolNix
+    # author's own apt repository, pinned: Debian bookworm ships v74, which does not see
+    # mp4 timed-text (mov_text) subtitles at all and dropped that track without a word
+    # (probed 2026-11-25). A late layer, so the driver, ffmpeg and wheel layers stay cached.
+    .run_commands(
+        "mkdir -p /etc/apt/keyrings",
+        f"curl -fsSL -o /etc/apt/keyrings/mkvtoolnix.gpg {MKVTOOLNIX_KEY_URL}",
+        f"echo '{MKVTOOLNIX_KEY_SHA256}  /etc/apt/keyrings/mkvtoolnix.gpg' | sha256sum -c -",
+        "echo 'deb [signed-by=/etc/apt/keyrings/mkvtoolnix.gpg]"
+        " https://mkvtoolnix.download/debian/ bookworm main'"
+        " > /etc/apt/sources.list.d/mkvtoolnix.list",
+        "apt-get update",
+        f"apt-get install -y --no-install-recommends mkvtoolnix={MKVTOOLNIX_VERSION}",
+        "rm -rf /var/lib/apt/lists/*",
+        "mkvmerge --version",
     )
     # NVENC_PRESET is read again at container import, where the deploying shell's
     # environment does not exist. Bake it into the image or the container silently
@@ -267,6 +291,28 @@ class PlannedDimensions:
 
 
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v"}
+
+# Video output containers and their media types. mp4 is the default and its output is
+# unchanged; mkv is written by mkvmerge and copies audio, subtitles, chapters and
+# attachments from the source as they are (see _mux_matroska).
+OUTPUT_CONTAINERS = {"mp4": "video/mp4", "mkv": "video/x-matroska"}
+
+
+def _normalize_container(raw_container: str | None) -> str:
+    normalized = (raw_container or "mp4").strip().lower()
+    if normalized not in OUTPUT_CONTAINERS:
+        raise ValueError(
+            f"Unsupported container: {raw_container}. Choose one of {sorted(OUTPUT_CONTAINERS)}."
+        )
+    return normalized
+
+
+def _normalize_strength(raw_strength: float, name: str = "strength") -> float:
+    """VideoSuperRes effect strength: 1.0 is the full effect, lower values blend it back."""
+    strength = float(raw_strength)
+    if not 0.0 <= strength <= 1.0:  # also false for NaN
+        raise ValueError(f"{name} must be between 0.0 and 1.0, got {raw_strength}.")
+    return strength
 
 
 def _normalize_resize_type(raw_resize_type: str) -> UpscaleType:
@@ -631,6 +677,186 @@ def _remux_color_args(hdr: HdrSettings | None) -> list[str]:
         "-color_primaries", "bt2020", "-color_trc", "smpte2084",
         "-colorspace", "bt2020nc", "-color_range", "tv",
     ]
+
+
+class ContainerRequestError(ValueError):
+    """Raised when the requested output container cannot be written for this input."""
+
+
+def _identify_matroska_source(source_path: str) -> dict:
+    """`mkvmerge -J` for the source, or ContainerRequestError if mkvmerge cannot read it.
+
+    Called before any GPU work, so an unreadable source fails the request at once and
+    not after the encode.
+    """
+    if shutil.which("mkvmerge") is None:
+        raise ContainerRequestError(
+            "Container request: container=mkv needs mkvmerge, which this image does not have."
+        )
+    result = subprocess.run(["mkvmerge", "-J", source_path], capture_output=True, text=True)
+    try:
+        info = json.loads(result.stdout)
+    except ValueError:
+        info = {}
+    container = info.get("container", {})
+    if not (container.get("recognized") and container.get("supported")):
+        detail = "; ".join(info.get("errors") or []) or "unrecognised file format"
+        raise ContainerRequestError(
+            "Container request: mkvmerge cannot read this source, so container=mkv cannot "
+            f"copy its audio and subtitles ({detail[-300:]}). Use container=mp4."
+        )
+    return info
+
+
+def _mkv_colour_args(hdr: HdrSettings | None, light: tuple[int, int] | None) -> list[str]:
+    """mkvmerge track-header colour options for our video (track 0 of its input file).
+
+    mkvmerge copies neither the SPS VUI nor the HDR10 SEI into the Matroska track header:
+    probed 2026-11-25 (v104), a plain remux of an HDR10 output left the Colour element
+    empty. A player that reads colour from the container would then see an untagged
+    stream, so the header repeats what the bitstream says: bt709 for SDR; BT.2020/PQ,
+    top-left chroma, the mastering display and the light levels for HDR10.
+    """
+    def colour(matrix: int, transfer: int, primaries: int) -> list[str]:
+        return [
+            "--colour-matrix-coefficients", f"0:{matrix}", "--colour-range", "0:1",
+            "--colour-transfer-characteristics", f"0:{transfer}",
+            "--colour-primaries", f"0:{primaries}",
+        ]
+
+    if hdr is None:
+        return colour(1, 1, 1)
+    # HdrSettings.primaries is G, B, R, white point in 0.00002 units (the HEVC MDCV order).
+    green_x, green_y, blue_x, blue_y, red_x, red_y, white_x, white_y = (
+        value / 50000 for value in hdr.primaries
+    )
+    max_cll, max_fall = light or (hdr.max_cll, hdr.max_fall)
+    args = [
+        *colour(9, 16, 9), "--chroma-siting", "0:1,1",
+        "--max-luminance", f"0:{hdr.max_mastering_luminance / 10000:g}",
+        "--min-luminance", f"0:{hdr.min_mastering_luminance / 10000:g}",
+        "--chromaticity-coordinates",
+        f"0:{red_x:g},{red_y:g},{green_x:g},{green_y:g},{blue_x:g},{blue_y:g}",
+        "--white-colour-coordinates", f"0:{white_x:g},{white_y:g}",
+    ]
+    # 0 means "unknown" in an explicit max_cll; the header then leaves the field out.
+    if max_cll > 0:
+        args += ["--max-content-light", f"0:{max_cll}"]
+    if max_fall > 0:
+        args += ["--max-frame-light", f"0:{max_fall}"]
+    return args
+
+
+def _mux_matroska(video_path: Path, source_path: Path, output_path: Path,
+                  hdr: HdrSettings | None, light: tuple[int, int] | None = None) -> None:
+    """Write the final MKV: our video track, and everything else from the source as it is.
+
+    `video_path` is the local mp4 intermediate that already carries the colour VUI (and
+    the HDR10 SEI); only its video track is used. Audio, subtitles, chapters, attachments
+    and tags come straight from the source, so nothing is re-encoded: the mp4 output must
+    transcode DTS or TrueHD to AAC and drop subtitles, this one copies them.
+
+    Timestamps: the mp4 remux lets ffmpeg shift the source to start at 0. mkvmerge keeps a
+    Matroska source's own timestamps (probed: a source starting at 10 s kept its audio at
+    10 s beside our video at 0) and normalises MPEG-TS itself, so Matroska sources alone
+    are shifted here, by the container start time ffmpeg would have subtracted.
+    """
+    source = _identify_matroska_source(source_path.as_posix())
+    probe = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=format_name,start_time",
+         "-of", "json", source_path.as_posix()],
+        capture_output=True, text=True, check=False,
+    )
+    try:
+        source_format = json.loads(probe.stdout).get("format", {})
+        start_ms = round(float(source_format.get("start_time") or 0.0) * 1000)
+    except ValueError:
+        source_format, start_ms = {}, 0
+    shift: list[str] = []
+    if start_ms and "matroska" in source_format.get("format_name", ""):
+        for track in source.get("tracks", []):
+            if track.get("type") != "video":
+                shift += ["--sync", f"{track['id']}:{-start_ms}"]
+        shift += ["--chapter-sync", str(-start_ms)]
+
+    # mkvmerge reads file names in the locale's charset. The final name can hold any
+    # characters the upload had, so mkvmerge writes an ASCII name and Python renames it.
+    partial_path = output_path.with_name("matroska-output.part")
+    command = [
+        "mkvmerge", "-o", partial_path.as_posix(),
+        "--no-audio", "--no-subtitles", "--no-chapters", "--no-attachments",
+        "--no-global-tags", "--no-track-tags",
+        *_mkv_colour_args(hdr, light), video_path.as_posix(),
+        "--no-video", *shift, source_path.as_posix(),
+    ]
+    result = subprocess.run(
+        command, capture_output=True, text=True,
+        env={**os.environ, "LC_ALL": "C.UTF-8"},
+    )
+    # mkvmerge exits 1 for warnings (the file is complete) and 2 for errors.
+    if result.returncode >= 2 or not partial_path.exists():
+        partial_path.unlink(missing_ok=True)
+        raise RuntimeError(f"Matroska muxing failed: {result.stdout.strip()[-1500:]}")
+    if result.returncode == 1:
+        warnings = [line for line in result.stdout.splitlines() if "arning" in line]
+        print(f"WARNING: mkvmerge reported: {' | '.join(warnings)[-1000:]}")
+
+    # mkvmerge skips a track it has no reader for without an error (v74 did that to mp4
+    # timed text), so count what arrived against what ffprobe sees in the source.
+    def stream_counts(path: Path) -> dict[str, int]:
+        # JSON, top-level streams only: for MPEG-TS the flat formats list every stream a
+        # second time under its program.
+        probed = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "stream=codec_type", "-of", "json",
+             path.as_posix()], capture_output=True, text=True, check=False,
+        ).stdout
+        try:
+            kinds = [stream.get("codec_type") for stream in json.loads(probed).get("streams", [])]
+        except ValueError:
+            kinds = []
+        return {kind: kinds.count(kind) for kind in ("audio", "subtitle")}
+
+    wanted, written = stream_counts(source_path), stream_counts(partial_path)
+    if written != wanted:
+        print(
+            f"WARNING: the Matroska output has {written['audio']} audio and "
+            f"{written['subtitle']} subtitle tracks, the source has {wanted['audio']} and "
+            f"{wanted['subtitle']}; mkvmerge could not copy the rest."
+        )
+    os.replace(partial_path, output_path)
+
+
+def _remux_output(video_inputs: list[str], source_path: Path, output_path: Path,
+                  hdr: HdrSettings | None, container: str, light: tuple[int, int] | None,
+                  scratch_dir: Path) -> None:
+    """The final `-c:v copy` remux of the GPU paths: colour VUI plus the source's audio.
+
+    `video_inputs` are the ffmpeg input arguments for the encoded video (one mp4, or the
+    concat list of the segments). For mp4 the command is the one each path always ran.
+    For mkv the same remux writes a video-only local intermediate (mkvmerge cannot edit
+    the VUI), and _mux_matroska builds the output from it and the source.
+    """
+    remux = [
+        "ffmpeg", "-y", "-loglevel", "error", *video_inputs,
+    ]
+    if container == "mkv":
+        target = scratch_dir / "matroska-video.mp4"
+        remux += ["-map", "0:v:0", "-an", "-c:v", "copy", *_remux_color_args(hdr),
+                  target.as_posix()]
+    else:
+        target = output_path
+        remux += [
+            "-i", source_path.as_posix(),
+            "-map", "0:v:0", *_audio_args(source_path.as_posix()),
+            "-c:v", "copy", *_remux_color_args(hdr),
+            "-movflags", "+faststart", output_path.as_posix(),
+        ]
+    result = subprocess.run(remux, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"Muxing failed: {result.stderr.strip()[-1500:]}")
+    if container == "mkv":
+        _mux_matroska(target, source_path, output_path, hdr, light)
+        target.unlink(missing_ok=True)
 
 
 def _aligned_dimension(size: int) -> int:
@@ -1060,12 +1286,13 @@ class _HdrLightLevels:
 
 
 def _signal_light_levels(hdr: HdrSettings, levels: list[_HdrLightLevels], paths,
-                         expected_sei: int) -> None:
+                         expected_sei: int) -> tuple[int, int]:
     """Combine the measured MaxCLL/MaxFALL, patch them into the intermediates, log both.
 
     Runs after every frame is encoded and before the final remux. With an explicit max_cll
     the stream already carries those values and nothing is patched. All segments get the
-    same whole-job values.
+    same whole-job values. Returns the (MaxCLL, MaxFALL) the stream now carries, which the
+    Matroska output repeats in its track header.
     """
     cll, fall = _HdrLightLevels.combine(levels)
     written: tuple[int, int] | None = (hdr.max_cll, hdr.max_fall)
@@ -1085,6 +1312,7 @@ def _signal_light_levels(hdr: HdrSettings, levels: list[_HdrLightLevels], paths,
         f"HDR10 light levels: measured MaxCLL/MaxFALL {cll:.1f}/{fall:.1f} nits; "
         f"written {written[0]}/{written[1]} ({source})."
     )
+    return written
 
 
 def _hdr10_to_p010(packed, levels: "_HdrLightLevels | None" = None):
@@ -1596,6 +1824,12 @@ class UpscaleWorker:
             f"level={NVENC_LEVEL}, maxrate={NVENC_MAX_MBPS}M, "
             f"refs={NVENC_REFS if self.encoder_refs else 'default'})"
         )
+        mkvmerge = shutil.which("mkvmerge")
+        print(
+            "Matroska muxer: "
+            + (subprocess.run([mkvmerge, "--version"], capture_output=True, text=True).stdout.strip()
+               if mkvmerge else "none (container=mkv requests will be rejected)")
+        )
         # Cached effect instances keyed by (thread, role) -> (settings key, effect). Three
         # roles exist: the upscale pass, the optional same-resolution preprocess pass, and
         # TrueHDR for HDR10 output.
@@ -1638,8 +1872,11 @@ class UpscaleWorker:
             stack.close()
 
     def _super_res(self, quality: str, output_width: int, output_height: int,
-                   role: str = "upscale", input_size: tuple[int, int] | None = None):
+                   role: str = "upscale", input_size: tuple[int, int] | None = None,
+                   strength: float = 1.0):
         """Reuse the loaded model when consecutive jobs share quality and output size.
+
+        `strength` (0.0-1.0) is the SDK's effect strength and part of the cache key.
 
         `input_size` selects the RGB10A2 image encoding (10-bit sources, packed (H,W)
         uint32 in and out); None keeps the float RGB8 interface. The encoding is part of
@@ -1648,7 +1885,7 @@ class UpscaleWorker:
         import nvvfx
 
         normalized_quality = _normalize_quality(quality)
-        key = (normalized_quality, output_width, output_height, input_size)
+        key = (normalized_quality, output_width, output_height, input_size, strength)
         cache_key = (threading.get_ident(), role)
         cached = self._sr_cache.get(cache_key)
         if cached is not None and cached[0] == key:
@@ -1663,11 +1900,17 @@ class UpscaleWorker:
             stack = self._sr_stacks.setdefault(cache_key[0], contextlib.ExitStack())
 
         quality_level = getattr(nvvfx.VideoSuperRes.QualityLevel, normalized_quality)
+        # The full-strength call stays exactly what it was: `strength` is passed only
+        # below 1.0, so default jobs do not depend on the SDK's own default value.
+        options = {} if strength == 1.0 else {"strength": strength}
+        if options:
+            print(f"VSR effect {normalized_quality} ({role}) at strength {strength:g}.")
         if input_size is None:
-            sr = stack.enter_context(nvvfx.VideoSuperRes(quality_level))
+            sr = stack.enter_context(nvvfx.VideoSuperRes(quality_level, **options))
         else:
             sr = stack.enter_context(nvvfx.VideoSuperRes(
                 quality_level, image_encoding=nvvfx.VideoSuperRes.ImageEncoding.RGB10A2,
+                **options,
             ))
             sr.input_width, sr.input_height = input_size
         sr.output_width = output_width
@@ -1677,7 +1920,7 @@ class UpscaleWorker:
         return sr
 
     def _preprocess_effect(self, preprocess: str | None, input_width: int, input_height: int,
-                           ten_bit: bool = False):
+                           ten_bit: bool = False, strength: float = 1.0):
         """Optional same-resolution restoration pass applied before upscaling.
 
         DENOISE/DEBLUR run at the input's own size, so the effect's output dimensions
@@ -1697,6 +1940,7 @@ class UpscaleWorker:
         return self._super_res(
             normalized, input_width, input_height, role="preprocess",
             input_size=(input_width, input_height) if ten_bit else None,
+            strength=strength,
         )
 
     def _true_hdr(self, hdr: HdrSettings, output_width: int, output_height: int):
@@ -1870,6 +2114,8 @@ class UpscaleWorker:
         quality: str,
         keep_aspect_ratio: bool = True,
         preprocess: str | None = None,
+        strength: float = 1.0,
+        preprocess_strength: float = 1.0,
     ) -> tuple[str, str]:
         import numpy as np
         from PIL import Image
@@ -1888,8 +2134,9 @@ class UpscaleWorker:
             keep_aspect_ratio=keep_aspect_ratio,
         )
 
-        sr = self._super_res(quality, plan.sr_width, plan.sr_height)
-        pre = self._preprocess_effect(preprocess, in_width, in_height)
+        sr = self._super_res(quality, plan.sr_width, plan.sr_height, strength=strength)
+        pre = self._preprocess_effect(preprocess, in_width, in_height,
+                                      strength=preprocess_strength)
         output_rgb = self._upscale_rgb_batch(sr, [rgb_array], plan, pre)[0]
 
         output_name = f"{stem}_upscaled.png"
@@ -1910,6 +2157,9 @@ class UpscaleWorker:
         preprocess: str | None = None,
         scratch_dir: Path | None = None,
         hdr: HdrSettings | None = None,
+        container: str = "mp4",
+        strength: float = 1.0,
+        preprocess_strength: float = 1.0,
     ) -> tuple[str, str]:
         """GPU-resident output path: VSR result goes to NVENC without touching the host.
 
@@ -1931,7 +2181,7 @@ class UpscaleWorker:
             torch.Tensor.__dlpack__ = lambda self, *a, **k: original_dlpack(self)
             UpscaleWorker._dlpack_patched = True
 
-        output_name = f"{stem}_upscaled.mp4"
+        output_name = f"{stem}_upscaled.{container}"
         output_path = output_dir / output_name
         # Intermediates stay on container-local disk; only the final output goes to the
         # Volume, so a failed job never commits a multi-GB partial stream.
@@ -1964,8 +2214,10 @@ class UpscaleWorker:
         # failed nvEncInitializeEncoder with error 8 -- every video job after an image
         # job in production, 2026-10-03. Swapping the effect first avoids that state.
         sr = self._super_res(quality, plan.sr_width, plan.sr_height,
-                             input_size=(in_width, in_height) if ten_bit else None)
-        pre = self._preprocess_effect(preprocess, in_width, in_height, ten_bit)
+                             input_size=(in_width, in_height) if ten_bit else None,
+                             strength=strength)
+        pre = self._preprocess_effect(preprocess, in_width, in_height, ten_bit,
+                                      preprocess_strength)
         # TrueHDR too: its warm-up run at the output size is part of the effect swap.
         thdr = self._true_hdr(hdr, plan.output_width, plan.output_height) if hdr else None
         sei = hdr10_sei_nals(hdr) if hdr else b""
@@ -2210,25 +2462,17 @@ class UpscaleWorker:
                 f"Encoder returned {packet_count} packets for {frame_count} frames; "
                 "output would be missing frames."
             )
+        light = None
         if levels is not None:
             # Measured MaxCLL/MaxFALL into the local intermediate, before the copy remux.
-            _signal_light_levels(hdr, [levels], [video_only_path], sei_count)
+            light = _signal_light_levels(hdr, [levels], [video_only_path], sei_count)
 
         # Remux to attach audio and write the colour VUI (bt709, or BT.2020/PQ for HDR10).
         # NVENC does not tag colour itself, and CLAUDE.md requires all three fields to be
         # set. The input here is an mp4 with real timestamps, so unlike a raw elementary
         # stream this remux is lossless.
-        mux_command = [
-            "ffmpeg", "-y", "-loglevel", "error",
-            "-i", video_only_path.as_posix(),
-            "-i", input_path.as_posix(),
-            "-map", "0:v:0", *_audio_args(input_path.as_posix()),
-            "-c:v", "copy", *_remux_color_args(hdr),
-            "-movflags", "+faststart", output_path.as_posix(),
-        ]
-        result = subprocess.run(mux_command, capture_output=True, text=True)
-        if result.returncode != 0:
-            raise RuntimeError(f"Muxing failed: {result.stderr.strip()[-1500:]}")
+        _remux_output(["-i", video_only_path.as_posix()], input_path, output_path, hdr,
+                      container, light, scratch_dir)
         video_only_path.unlink(missing_ok=True)
         decode_log_path.unlink(missing_ok=True)
 
@@ -2242,7 +2486,7 @@ class UpscaleWorker:
             f"batch={batch_limit}, gpu-encoder=yes{', 10-bit' if ten_bit else ''}"
             f"{', hdr=' + hdr.describe() if hdr else ''})"
         )
-        return output_name, "video/mp4"
+        return output_name, OUTPUT_CONTAINERS[container]
 
     def _upscale_video_segmented(
         self,
@@ -2259,6 +2503,9 @@ class UpscaleWorker:
         preprocess: str | None = None,
         scratch_dir: Path | None = None,
         hdr: HdrSettings | None = None,
+        container: str = "mp4",
+        strength: float = 1.0,
+        preprocess_strength: float = 1.0,
     ) -> tuple[str, str]:
         """Parallel NVENC sessions over keyframe-aligned segments (see NVENC_SESSIONS).
 
@@ -2281,7 +2528,7 @@ class UpscaleWorker:
             torch.Tensor.__dlpack__ = lambda self, *a, **k: original_dlpack(self)
             UpscaleWorker._dlpack_patched = True
 
-        output_name = f"{stem}_upscaled.mp4"
+        output_name = f"{stem}_upscaled.{container}"
         output_path = output_dir / output_name
         scratch_dir = Path(tempfile.mkdtemp(prefix="segments-", dir=scratch_dir))
 
@@ -2332,8 +2579,10 @@ class UpscaleWorker:
                 # mitigation of _upscale_video_gpu, kept for the same reason).
                 effect_start = time.perf_counter()
                 sr = self._super_res(quality, plan.sr_width, plan.sr_height,
-                                     input_size=(in_width, in_height) if ten_bit else None)
-                pre = self._preprocess_effect(preprocess, in_width, in_height, ten_bit)
+                                     input_size=(in_width, in_height) if ten_bit else None,
+                                     strength=strength)
+                pre = self._preprocess_effect(preprocess, in_width, in_height, ten_bit,
+                                              preprocess_strength)
                 thdr = self._true_hdr(hdr, plan.output_width, plan.output_height) if hdr else None
                 levels = _HdrLightLevels("cuda") if hdr else None
                 light_levels[slot] = levels
@@ -2514,10 +2763,11 @@ class UpscaleWorker:
         frame_count = sum(segment_frames)
         if frame_count == 0:
             raise ValueError("Uploaded video has no decodable frames.")
+        light = None
         if hdr:
             # Whole-job MaxCLL/MaxFALL, the same in every segment, patched into the local
             # segment files before the concat remux.
-            _signal_light_levels(
+            light = _signal_light_levels(
                 hdr, [level for level in light_levels if level is not None],
                 [path for path in segment_paths if path.exists()], sum(sei_counts),
             )
@@ -2527,17 +2777,8 @@ class UpscaleWorker:
         )
         # Joins the segments without re-encoding, then the same remux as
         # _upscale_video_gpu: audio from the source and the colour VUI.
-        mux_command = [
-            "ffmpeg", "-y", "-loglevel", "error",
-            "-f", "concat", "-safe", "0", "-i", list_path.as_posix(),
-            "-i", input_path.as_posix(),
-            "-map", "0:v:0", *_audio_args(input_path.as_posix()),
-            "-c:v", "copy", *_remux_color_args(hdr),
-            "-movflags", "+faststart", output_path.as_posix(),
-        ]
-        result = subprocess.run(mux_command, capture_output=True, text=True)
-        if result.returncode != 0:
-            raise RuntimeError(f"Muxing failed: {result.stderr.strip()[-1500:]}")
+        _remux_output(["-f", "concat", "-safe", "0", "-i", list_path.as_posix()],
+                      input_path, output_path, hdr, container, light, scratch_dir)
         shutil.rmtree(scratch_dir, ignore_errors=True)
 
         finished = time.perf_counter()
@@ -2557,7 +2798,7 @@ class UpscaleWorker:
             f"{', 10-bit' if ten_bit else ''}{', hdr=' + hdr.describe() if hdr else ''}; "
             f"peak RSS {resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1048576:.1f} GiB)"
         )
-        return output_name, "video/mp4"
+        return output_name, OUTPUT_CONTAINERS[container]
 
     def _upscale_video(
         self,
@@ -2573,6 +2814,9 @@ class UpscaleWorker:
         preprocess: str | None = None,
         scratch_dir: Path | None = None,
         hdr: HdrSettings | None = None,
+        container: str = "mp4",
+        strength: float = 1.0,
+        preprocess_strength: float = 1.0,
     ) -> tuple[str, str]:
         import numpy as np
 
@@ -2599,21 +2843,29 @@ class UpscaleWorker:
                     f"HDR10 request: output {plan.output_width}x{plan.output_height} is above "
                     f"the largest size TrueHDR was verified at ({MAX_HDR_OUTPUT_PIXELS} pixels)."
                 )
+        if container == "mkv":
+            # Fail before any GPU work if mkvmerge cannot read the source.
+            _identify_matroska_source(input_path.as_posix())
         if gpu_path:
             segments = _plan_segments(input_path.as_posix(), NVENC_SESSIONS)
             if segments is not None:
                 return self._upscale_video_segmented(
                     input_path, output_dir, stem, segments, resize_type, scale, width,
                     height, quality, keep_aspect_ratio, preprocess, scratch_dir, hdr,
+                    container, strength, preprocess_strength,
                 )
             return self._upscale_video_gpu(
                 input_path, output_dir, stem, resize_type, scale, width, height,
                 quality, keep_aspect_ratio, preprocess, scratch_dir, hdr,
+                container, strength, preprocess_strength,
             )
 
-        output_name = f"{stem}_upscaled.mp4"
+        output_name = f"{stem}_upscaled.{container}"
         output_path = output_dir / output_name
         scratch_dir = scratch_dir or output_dir
+        # The piped encoder writes mp4 with audio. For mkv that file is a local
+        # intermediate and mkvmerge takes only its video track.
+        encode_path = scratch_dir / "piped-video.mp4" if container == "mkv" else output_path
         stderr_path = scratch_dir / "ffmpeg.log"
         decode_log_path = scratch_dir / "ffmpeg-decode.log"
 
@@ -2634,7 +2886,7 @@ class UpscaleWorker:
             output_height=plan.output_height,
             fps=fps,
             audio_source_path=input_path.as_posix(),
-            output_path=output_path.as_posix(),
+            output_path=encode_path.as_posix(),
             tune=getattr(self, "encoder_tune", None),
             refs=getattr(self, "encoder_refs", False),
         )
@@ -2723,8 +2975,9 @@ class UpscaleWorker:
             rgb_batch.clear()
 
         try:
-            sr = self._super_res(quality, plan.sr_width, plan.sr_height)
-            pre = self._preprocess_effect(preprocess, in_width, in_height)
+            sr = self._super_res(quality, plan.sr_width, plan.sr_height, strength=strength)
+            pre = self._preprocess_effect(preprocess, in_width, in_height,
+                                          strength=preprocess_strength)
             while True:
                 decode_start = time.perf_counter()
                 item = frame_queue.get()
@@ -2763,6 +3016,9 @@ class UpscaleWorker:
         if frame_count == 0:
             decode_tail = decode_log_path.read_bytes()[-2000:].decode("utf-8", errors="replace")
             raise ValueError(f"Uploaded video has no decodable frames. {decode_tail}")
+        if container == "mkv":
+            _mux_matroska(encode_path, input_path, output_path, None)
+            encode_path.unlink(missing_ok=True)
 
         elapsed = max(time.perf_counter() - started, 1e-6)
         print(
@@ -2775,7 +3031,7 @@ class UpscaleWorker:
 
         stderr_path.unlink(missing_ok=True)
         decode_log_path.unlink(missing_ok=True)
-        return output_name, "video/mp4"
+        return output_name, OUTPUT_CONTAINERS[container]
 
     @modal.method()
     def run(
@@ -2793,6 +3049,9 @@ class UpscaleWorker:
         truehdr: str = "",
         master_display: str = "",
         max_cll: str = "",
+        container: str = "mp4",
+        strength: float = 1.0,
+        preprocess_strength: float = 1.0,
     ) -> dict[str, str]:
         self._logged_hybrid = False
         self._logged_preprocess = False
@@ -2832,14 +3091,25 @@ class UpscaleWorker:
                 hdr = parse_hdr_settings(truehdr, master_display, max_cll)
             except ValueError as exc:
                 raise HdrRequestError(f"HDR10 request: {exc}") from None
+            container = _normalize_container(container)
+            effect = {
+                "strength": _normalize_strength(strength),
+                "preprocess_strength": _normalize_strength(
+                    preprocess_strength, "preprocess_strength"
+                ),
+            }
             if _is_video(input_name, mime_type):
                 output_name, media_type = self._upscale_video(
-                    *args, scratch_dir=scratch_dir, hdr=hdr
+                    *args, scratch_dir=scratch_dir, hdr=hdr, container=container, **effect
                 )
             elif hdr is not None:
                 raise HdrRequestError("HDR10 request: TrueHDR output is for video inputs only.")
+            elif container != "mp4":
+                raise ContainerRequestError(
+                    "Container request: container applies to video inputs only."
+                )
             else:
-                output_name, media_type = self._upscale_image(*args)
+                output_name, media_type = self._upscale_image(*args, **effect)
         except BaseException:
             # /result cannot clean up after a failure (it only learns the job id from a
             # successful return), so drop the job's files here before the commit below.
@@ -2905,6 +3175,12 @@ def api():
         truehdr: str = Form(""),
         master_display: str = Form(""),
         max_cll: str = Form(""),
+        # Video output container. mp4 (default, unchanged) or mkv, which copies the
+        # source's audio, subtitles and chapters as they are.
+        container: str = Form("mp4"),
+        # VideoSuperRes effect strength, 0.0-1.0, for the upscale and the preprocess pass.
+        strength: float = Form(1.0),
+        preprocess_strength: float = Form(1.0),
     ):
         try:
             if _normalize_quality(quality) not in UPSCALE_QUALITIES:
@@ -2927,10 +3203,13 @@ def api():
                     raise ValueError(
                         f"Output dimension exceeds maximum supported edge of {MAX_OUTPUT_EDGE} (got {width}x{height})."
                     )
-            if parse_hdr_settings(truehdr, master_display, max_cll) is not None and not _is_video(
-                file.filename or "", file.content_type
-            ):
+            is_video = _is_video(file.filename or "", file.content_type)
+            if parse_hdr_settings(truehdr, master_display, max_cll) is not None and not is_video:
                 raise ValueError("truehdr (HDR10 output) is for video inputs only.")
+            if _normalize_container(container) != "mp4" and not is_video:
+                raise ValueError("container applies to video inputs only.")
+            _normalize_strength(strength)
+            _normalize_strength(preprocess_strength, "preprocess_strength")
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -2963,6 +3242,9 @@ def api():
             truehdr=truehdr,
             master_display=master_display,
             max_cll=max_cll,
+            container=container,
+            strength=strength,
+            preprocess_strength=preprocess_strength,
         )
         return {"call_id": call.object_id, "job_id": job_id}
 
@@ -2978,8 +3260,12 @@ def api():
         except Exception as exc:  # noqa: BLE001
             msg = str(exc)
             if (
-                isinstance(exc, (UpscaleOnlyError, OutputDimensionExceededError, HdrRequestError))
+                isinstance(exc, (UpscaleOnlyError, OutputDimensionExceededError, HdrRequestError,
+                                 ContainerRequestError))
                 or "HDR10 request:" in msg
+                or "Container request:" in msg
+                or "Unsupported container" in msg
+                or "must be between 0.0 and 1.0" in msg
                 or "Upscaling only" in msg
                 or "Output dimension exceeds" in msg
                 or "Unsupported resize type" in msg
