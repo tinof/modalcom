@@ -1070,7 +1070,8 @@ def _ffmpeg_encode_command(
         "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709",
         *codec_args,
         *_audio_args(audio_source_path),
-        "-shortest",
+        # No -shortest: it cut the picture to the audio's length (347 of 352 frames on a
+        # clip whose audio ended 80 ms early, probed 2026-11-25). The GPU paths never had it.
         "-movflags", "+faststart",
         output_path,
     ]
