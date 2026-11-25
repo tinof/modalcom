@@ -1,121 +1,37 @@
-"""Modal Image definition for FlashVSR-Pro.
+"""Modal Image definition for the FlashVSR v1.1 service.
 
-Stack pins live in the constants below; each names its previously verified
-fallback. The Blackwell target (RTX PRO 6000, sm_120) requires the CUDA 13 /
-torch 2.13 stack — the fallback stack cannot run on that GPU at all, so falling
-back also means reverting the GPU tiers in config.py to A100-80GB / A10G.
+The stack pins and the Block-Sparse-Attention build step live in `bsa_build.py`,
+shared with the FlashVSR+ image (`plus_image.py`). The Blackwell target (RTX PRO
+6000, sm_120) needs the CUDA 13 / torch 2.12 stack pinned there; the fallback
+stack named beside each pin cannot run on that GPU at all, so falling back also
+means reverting the GPU tiers in config.py to A100-80GB / A10G.
 
-The Block-Sparse-Attention CUDA kernels are the expensive part (~25 heavy
-cutlass translation units). They are built once by `_build_or_install_bsa` into
-a wheel cached on the `flashvsr-build-cache` Volume, keyed on source hash +
-torch version + arch list. Rebuilding the image with unchanged BSA inputs
-installs the cached wheel in seconds instead of recompiling for an hour.
-`modal_app/` is attached last as a mount, so code edits never touch this layer.
-
-A successful build proves the kernels compiled, not that they compute the right
-thing — run `modal run -m modal_app.probe_gpu` after any stack change.
+`modal_app/` is attached last as a mount, so code edits never touch the kernel
+layer.
 """
 
 import modal
 
 from .app import build_cache_volume
-
-# Fallback (previously verified): "nvidia/cuda:12.4.1-devel-ubuntu22.04" / "3.11"
-CUDA_BASE_IMAGE = "nvidia/cuda:13.0.1-devel-ubuntu24.04"
-PYTHON_VERSION = "3.12"
-
-# Fallback (previously verified): torch 2.6.0+cu124 / torchvision 0.21.0+cu124
-# with extra_index_url="https://download.pytorch.org/whl/cu124".
-# torchaudio is deliberately absent: nothing in the codebase imports it (audio
-# is handled by ffmpeg), and its release line has decoupled from torch's.
-#
-# Modal's uv resolver lands these as +cu130 builds from the PyTorch index. The
-# two pins MUST stay a matching pair (torchvision 0.27.x <-> torch 2.12.x): a
-# mismatch surfaces at runtime as "operator torchvision::nms does not exist"
-# when transformers imports torchvision. They are also repeated in the layer-3
-# install below so its joint resolution cannot drift torch to another version.
-TORCH_PACKAGES = (
-    "torch==2.12.1",
-    "torchvision==0.27.1",
+from .bsa_build import (
+    BLOCK_SPARSE_ATTN_CUDA_ARCHS,
+    BSA_SRC,
+    BUILD_CACHE_MOUNT,
+    CUDA_BASE_IMAGE,
+    PYTHON_VERSION,
+    TORCH_PACKAGES,
+    _build_or_install_bsa,
 )
 
-# sm_80 = A100, sm_86 = A10G, sm_120 = Blackwell RTX PRO 6000 (the deployed
-# tier). Keeping 80/86 in the fatbin preserves portability back to the cheaper
-# Ampere GPUs without another kernel build. Fallback stack supports "80;86" only.
-BLOCK_SPARSE_ATTN_CUDA_ARCHS = "80;86;120"
-
-BUILD_CACHE_MOUNT = "/build-cache"
-BSA_SRC = "/workspace/FlashVSR-Pro/Block-Sparse-Attention"
-
-
-def _build_or_install_bsa() -> None:
-    """Image build step: install the BSA wheel from cache, or compile and cache it.
-
-    Runs via Image.run_function with a GPU and 16 CPUs. The cache key covers the
-    kernel sources, the torch version, and the arch list, so any input that
-    changes the binary forces a fresh compile — and nothing else does.
-    """
-    import hashlib
-    import os
-    import shutil
-    import subprocess
-    import sys
-
-    import torch
-
-    hasher = hashlib.sha256()
-    for root, dirs, files in sorted(os.walk(BSA_SRC)):
-        dirs[:] = sorted(d for d in dirs if d not in {".git", "build", "dist"})
-        for name in sorted(files):
-            if os.path.splitext(name)[1] in {".py", ".cu", ".cpp", ".h", ".hpp", ".cuh"}:
-                path = os.path.join(root, name)
-                hasher.update(path.removeprefix(BSA_SRC).encode())
-                with open(path, "rb") as f:
-                    hasher.update(f.read())
-    hasher.update(torch.__version__.encode())
-    hasher.update(BLOCK_SPARSE_ATTN_CUDA_ARCHS.encode())
-    key = hasher.hexdigest()[:20]
-
-    cache_dir = os.path.join(BUILD_CACHE_MOUNT, "wheels", key)
-    cached = sorted(
-        os.path.join(cache_dir, f) for f in os.listdir(cache_dir) if f.endswith(".whl")
-    ) if os.path.isdir(cache_dir) else []
-
-    if cached:
-        print(f"[bsa-build] cache HIT ({key}): installing {os.path.basename(cached[0])}")
-        subprocess.run([sys.executable, "-m", "pip", "install", cached[0]], check=True)
-        return
-
-    # Each cutlass translation unit peaks at several GB of RAM in nvcc; an
-    # uncapped MAX_JOBS OOM-kills the builder long before CPUs are the limit.
-    jobs = max(4, min(os.cpu_count() or 4, 10))
-    print(
-        f"[bsa-build] cache MISS ({key}): compiling for archs "
-        f"{BLOCK_SPARSE_ATTN_CUDA_ARCHS} with MAX_JOBS={jobs} — expect ~30-40 min"
-    )
-    env = os.environ | {
-        "CXX": "g++",
-        "CC": "gcc",
-        "MAX_JOBS": str(jobs),
-        "BLOCK_SPARSE_ATTN_CUDA_ARCHS": BLOCK_SPARSE_ATTN_CUDA_ARCHS,
-    }
-    subprocess.run(
-        [sys.executable, "setup.py", "bdist_wheel"], cwd=BSA_SRC, env=env, check=True
-    )
-    wheels = sorted(
-        os.path.join(BSA_SRC, "dist", f)
-        for f in os.listdir(os.path.join(BSA_SRC, "dist"))
-        if f.endswith(".whl")
-    )
-    if not wheels:
-        raise RuntimeError("BSA bdist_wheel produced no wheel in dist/")
-
-    os.makedirs(cache_dir, exist_ok=True)
-    shutil.copy2(wheels[-1], cache_dir)
-    build_cache_volume.commit()
-    print(f"[bsa-build] cached {os.path.basename(wheels[-1])} under wheels/{key}/")
-    subprocess.run([sys.executable, "-m", "pip", "install", wheels[-1]], check=True)
-
+__all__ = [
+    "BLOCK_SPARSE_ATTN_CUDA_ARCHS",
+    "BSA_SRC",
+    "BUILD_CACHE_MOUNT",
+    "CUDA_BASE_IMAGE",
+    "PYTHON_VERSION",
+    "TORCH_PACKAGES",
+    "flashvsr_image",
+]
 
 # Cache-efficient layer ordering: base → system → pytorch → deps → project → CUDA kernels
 flashvsr_image = (

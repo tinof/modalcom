@@ -1,9 +1,12 @@
-"""FlashVSR-Pro inference service classes for Modal.
+"""FlashVSR v1.1 inference service classes for Modal.
 
-Three classes with different GPU requirements:
-- FlashVSRFull:     A100-80GB, full mode (Wan2.1 VAE)
-- FlashVSRTiny:     A10G, tiny mode (TCDecoder)
-- FlashVSRTinyLong: A10G, tiny-long mode (TCDecoder)
+Three classes, one per mode, all on the GPU set in config.py (RTX PRO 6000):
+- FlashVSRFull:     full mode (Wan2.1 VAE)
+- FlashVSRTiny:     tiny mode (TCDecoder)
+- FlashVSRTinyLong: tiny-long mode (TCDecoder, streaming)
+
+This service holds a whole clip in memory and is for short clips only. Long
+videos go through the FlashVSR+ segment worker (plus_service.py).
 """
 
 from __future__ import annotations
@@ -32,6 +35,7 @@ from .config import (
     PROMPT_TENSOR_PATH,
     TCD_VAE_PATH,
     WAN_VAE_PATH,
+    temp_sibling,
 )
 from .image import flashvsr_image
 from .types import InferenceRequest
@@ -156,8 +160,11 @@ def _run_inference(pipe, vae_instance, req: InferenceRequest):
         apply_tiled_inference_simple = None
 
     device = "cuda"
-    dtype_map = {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}
-    dtype = dtype_map.get(req.dtype, torch.bfloat16)
+    # _load_models loads in bf16 and validate_request accepts nothing else. A
+    # request built past the validator must not feed the models another dtype.
+    if req.dtype != "bf16":
+        raise ValueError(f"dtype must be one of ['bf16'] (got {req.dtype!r}).")
+    dtype = torch.bfloat16
 
     input_abs = os.path.join(IO_MOUNT_PATH, req.input_path)
     output_abs = os.path.join(IO_MOUNT_PATH, req.output_path)
@@ -238,18 +245,20 @@ def _run_inference(pipe, vae_instance, req: InferenceRequest):
 
     frames = tensor2video(video)
 
-    # Match frame count
-    if len(frames) > total_frames_orig:
-        frames = frames[:total_frames_orig]
-    elif len(frames) < total_frames_orig:
-        frames.extend([frames[-1]] * (total_frames_orig - len(frames)))
+    # The input was padded so that the pipeline emits at least every source
+    # frame. Fewer means frames were lost; repeating the last one would hide it.
+    if len(frames) < total_frames_orig:
+        raise RuntimeError(
+            f"The pipeline returned {len(frames)} frames for a {total_frames_orig}-frame input."
+        )
+    frames = frames[:total_frames_orig]
 
     # Save with or without audio
     if req.keep_audio and audio_available and input_video_path and has_audio_stream(input_video_path):
         print("Preserving audio...")
         success = save_video_with_audio_piped(frames, output_abs, input_video_path, fps=fps, quality=req.quality)
         if not success:
-            temp_output = output_abs.replace(".mp4", "_temp.mp4")
+            temp_output = temp_sibling(output_abs)
             save_video(frames, temp_output, fps=fps, quality=req.quality)
             copy_video_with_audio(input_video_path, temp_output, output_abs)
             if os.path.exists(temp_output):
@@ -283,7 +292,7 @@ _volumes = {MODEL_MOUNT_PATH: model_volume, IO_MOUNT_PATH: io_volume}
     timeout=CONTAINER_TIMEOUT,
 )
 class FlashVSRFull:
-    """Full-mode inference (Wan2.1 VAE) on A100-80GB."""
+    """Full-mode inference (Wan2.1 VAE)."""
 
     @modal.enter()
     def setup(self):
@@ -307,7 +316,7 @@ class FlashVSRFull:
     timeout=CONTAINER_TIMEOUT,
 )
 class FlashVSRTiny:
-    """Tiny-mode inference (TCDecoder) on A10G."""
+    """Tiny-mode inference (TCDecoder)."""
 
     @modal.enter()
     def setup(self):
@@ -331,7 +340,7 @@ class FlashVSRTiny:
     timeout=CONTAINER_TIMEOUT,
 )
 class FlashVSRTinyLong:
-    """Tiny-long mode inference (TCDecoder, streaming) on A10G."""
+    """Tiny-long mode inference (TCDecoder, streaming)."""
 
     @modal.enter()
     def setup(self):
