@@ -17,7 +17,7 @@ is also in this repository's history.
 ## Conventions
 
 - **One directory per project, kebab-case, matching its folder name locally and here.**
-- **Deploy from the project directory** (`cd ltx2 && modal deploy image_to_video.py`) — image
+- **Deploy from the project directory** (`cd flashvsr-pro && modal deploy -m modal_app.deploy`) — image
   definitions reference local paths relative to it.
 - **Pin container dependencies in the image definition**, not in a root requirements file.
   Any `requirements.txt` / `pyproject.toml` in a project covers only its local client.
