@@ -16,6 +16,8 @@ from einops import rearrange
 from PIL import Image
 from tqdm import tqdm
 
+from .plus_plan import v1_padded_frame_count
+
 
 @functools.lru_cache(maxsize=1)
 def nvenc_available() -> bool:
@@ -192,9 +194,8 @@ def prepare_input_tensor(
 
         sW, sH, tW, tH = compute_scaled_and_target_dims(w0, h0, scale=scale, multiple=128)
 
-        # Pad to 8n+1
-        k = (N0 - 1 + 7) // 8
-        F = k * 8 + 1
+        # Pad so that the frames the pipeline emits (F - 4) cover the whole clip.
+        F = v1_padded_frame_count(N0)
         pad_len = F - N0
         paths = paths0 + [paths0[-1]] * pad_len
 
@@ -257,8 +258,10 @@ def prepare_input_tensor(
         sW, sH, tW, tH = compute_scaled_and_target_dims(w0, h0, scale=scale, multiple=128)
 
         idx = list(range(total))
-        k = (total - 1 + 7) // 8
-        F = k * 8 + 1
+        # The streaming loop emits F - 4 frames for an input of F = 8k+1 frames.
+        # Padding only up to the next 8k+1 lost up to four real frames at the
+        # tail (and crashed below 18 frames); see plus_plan.v1_padded_frame_count.
+        F = v1_padded_frame_count(total)
         pad_len = F - total
         idx = idx + [total - 1] * pad_len
 
