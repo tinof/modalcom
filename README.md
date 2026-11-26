@@ -6,14 +6,18 @@ constraints are non-obvious, and its own Modal app and Volumes.
 
 | Project | What it does | Modal app |
 |---|---|---|
-| [`rtx-vsr/`](rtx-vsr/) | NVIDIA RTX Video Super Resolution (NGX) as an authenticated job queue. Fully GPU-resident NVDEC → VSR → NVENC path. | `rtx-media-upscaler` |
 | [`flashvsr-pro/`](flashvsr-pro/) | FlashVSR-Pro diffusion video super-resolution, full and tiny tiers. | `flashvsr-pro` |
 | [`ltx2/`](ltx2/) | LTX-2 text-to-video, two-stage generate-then-upscale. | `ltx2` |
+
+`rtx-vsr` (NVIDIA RTX Video Super Resolution as an authenticated job queue, Modal app
+`rtx-media-upscaler`) moved to its own repository on 2026-11-26:
+[tinof/rtx-vsr-modal](https://github.com/tinof/rtx-vsr-modal). Its history up to the move
+is also in this repository's history.
 
 ## Conventions
 
 - **One directory per project, kebab-case, matching its folder name locally and here.**
-- **Deploy from the project directory** (`cd rtx-vsr && modal deploy modal_app.py`) — image
+- **Deploy from the project directory** (`cd ltx2 && modal deploy image_to_video.py`) — image
   definitions reference local paths relative to it.
 - **Pin container dependencies in the image definition**, not in a root requirements file.
   Any `requirements.txt` / `pyproject.toml` in a project covers only its local client.
